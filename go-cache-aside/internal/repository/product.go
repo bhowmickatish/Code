@@ -1,0 +1,188 @@
+package repository
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/atish/go-cache-aside/internal/model"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+)
+
+const productKeyPrefix = "product:"
+
+type ProductRepository struct {
+	db       *pgxpool.Pool
+	cache    redis.UniversalClient
+	cacheTTL time.Duration
+}
+
+func NewProductRepository(db *pgxpool.Pool, cache redis.UniversalClient, cacheTTL time.Duration) *ProductRepository {
+	return &ProductRepository{db: db, cache: cache, cacheTTL: cacheTTL}
+}
+
+func (r *ProductRepository) GetByID(ctx context.Context, id int64) (*model.Product, error) {
+	key := productKey(id)
+
+	cached, err := r.cache.Get(ctx, key).Bytes()
+	if err == nil {
+		var p model.Product
+		if err := json.Unmarshal(cached, &p); err == nil {
+			return &p, nil
+		}
+	}
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("cache get: %w", err)
+	}
+
+	p, err := r.getFromDB(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := json.Marshal(p)
+	if err != nil {
+		return p, nil
+	}
+	if err := r.cache.Set(ctx, key, data, r.cacheTTL).Err(); err != nil {
+		return p, fmt.Errorf("cache set: %w", err)
+	}
+
+	return p, nil
+}
+
+func (r *ProductRepository) Create(ctx context.Context, name string, price float64) (*model.Product, error) {
+	var p model.Product
+	err := r.db.QueryRow(ctx,
+		`INSERT INTO products (name, price) VALUES ($1, $2)
+		 RETURNING id, name, price, created_at`,
+		name, price,
+	).Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("insert product: %w", err)
+	}
+	return &p, nil
+}
+
+func (r *ProductRepository) Update(ctx context.Context, id int64, name string, price float64) (*model.Product, error) {
+	var p model.Product
+	err := r.db.QueryRow(ctx,
+		`UPDATE products SET name = $2, price = $3 WHERE id = $1
+		 RETURNING id, name, price, created_at`,
+		id, name, price,
+	).Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("product not found")
+		}
+		return nil, fmt.Errorf("update product: %w", err)
+	}
+
+	if err := r.cache.Del(ctx, productKey(id)).Err(); err != nil {
+		return &p, fmt.Errorf("cache invalidate: %w", err)
+	}
+
+	return &p, nil
+}
+
+func (r *ProductRepository) Delete(ctx context.Context, id int64) error {
+	tag, err := r.db.Exec(ctx, `DELETE FROM products WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("delete product: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("product not found")
+	}
+
+	if err := r.cache.Del(ctx, productKey(id)).Err(); err != nil {
+		return fmt.Errorf("cache invalidate: %w", err)
+	}
+	return nil
+}
+
+// List returns a paginated slice of products directly from Postgres (no cache).
+func (r *ProductRepository) List(ctx context.Context, limit, offset int) (model.ProductPage, error) {
+	var total int
+	if err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM products`).Scan(&total); err != nil {
+		return model.ProductPage{}, fmt.Errorf("count products: %w", err)
+	}
+
+	rows, err := r.db.Query(ctx,
+		`SELECT id, name, price, created_at FROM products ORDER BY id LIMIT $1 OFFSET $2`,
+		limit, offset,
+	)
+	if err != nil {
+		return model.ProductPage{}, fmt.Errorf("list products: %w", err)
+	}
+	defer rows.Close()
+
+	items, err := scanProducts(rows)
+	if err != nil {
+		return model.ProductPage{}, err
+	}
+	return model.ProductPage{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+}
+
+// Search finds products by name substring directly from Postgres (no cache).
+func (r *ProductRepository) Search(ctx context.Context, query string, limit, offset int) (model.ProductPage, error) {
+	var total int
+	if err := r.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM products WHERE name ILIKE '%' || $1 || '%'`,
+		query,
+	).Scan(&total); err != nil {
+		return model.ProductPage{}, fmt.Errorf("count products: %w", err)
+	}
+
+	rows, err := r.db.Query(ctx,
+		`SELECT id, name, price, created_at FROM products
+		 WHERE name ILIKE '%' || $1 || '%' ORDER BY id LIMIT $2 OFFSET $3`,
+		query, limit, offset,
+	)
+	if err != nil {
+		return model.ProductPage{}, fmt.Errorf("search products: %w", err)
+	}
+	defer rows.Close()
+
+	items, err := scanProducts(rows)
+	if err != nil {
+		return model.ProductPage{}, err
+	}
+	return model.ProductPage{Items: items, Total: total, Limit: limit, Offset: offset}, nil
+}
+
+func scanProducts(rows pgx.Rows) ([]model.Product, error) {
+	var products []model.Product
+	for rows.Next() {
+		var p model.Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan product: %w", err)
+		}
+		products = append(products, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read products: %w", err)
+	}
+	return products, nil
+}
+
+func (r *ProductRepository) getFromDB(ctx context.Context, id int64) (*model.Product, error) {
+	var p model.Product
+	err := r.db.QueryRow(ctx,
+		`SELECT id, name, price, created_at FROM products WHERE id = $1`, id,
+	).Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("product not found")
+		}
+		return nil, fmt.Errorf("query product: %w", err)
+	}
+	return &p, nil
+}
+
+func productKey(id int64) string {
+	return fmt.Sprintf("%s%d", productKeyPrefix, id)
+}

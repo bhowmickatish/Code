@@ -1,0 +1,118 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis-node-1:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_node_1:/data
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-config-file
+      - /data/nodes.conf
+      - --cluster-node-timeout
+      - "5000"
+      - --appendonly
+      - "yes"
+      - --bind
+      - "0.0.0.0"
+      - --cluster-announce-ip
+      - "127.0.0.1"
+      - --cluster-announce-port
+      - "6379"
+    networks:
+      - redis-cluster
+
+  redis-node-2:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_node_2:/data
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-config-file
+      - /data/nodes.conf
+      - --cluster-node-timeout
+      - "5000"
+      - --appendonly
+      - "yes"
+      - --bind
+      - "0.0.0.0"
+      - --cluster-announce-ip
+      - "127.0.0.1"
+      - --cluster-announce-port
+      - "6380"
+    networks:
+      - redis-cluster
+
+  redis-node-3:
+    image: redis:7-alpine
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis_node_3:/data
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-config-file
+      - /data/nodes.conf
+      - --cluster-node-timeout
+      - "5000"
+      - --appendonly
+      - "yes"
+      - --bind
+      - "0.0.0.0"
+      - --cluster-announce-ip
+      - "127.0.0.1"
+      - --cluster-announce-port
+      - "6381"
+    networks:
+      - redis-cluster
+
+  redis-cluster-init:
+    image: redis:7-alpine
+    depends_on:
+      - redis-node-1
+      - redis-node-2
+      - redis-node-3
+    networks:
+      - redis-cluster
+    restart: "no"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        sleep 3
+        redis-cli --cluster create redis-node-1:6379 redis-node-2:6379 redis-node-3:6379 --cluster-replicas 0 --cluster-yes || true
+
+networks:
+  redis-cluster:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_node_1:
+  redis_node_2:
+  redis_node_3:

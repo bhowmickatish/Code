@@ -1,0 +1,577 @@
+# Design Document: Go Cache-Aside Sample
+
+## 1. Overview
+
+This application is a minimal REST API that demonstrates the **cache-aside** caching pattern. PostgreSQL is the system of record; Redis is an optional, lazy read cache for single-entity lookups by ID.
+
+The design optimizes **repeat reads of the same product** while keeping list and search operations authoritative and complete by always querying Postgres.
+
+### Goals
+
+- Demonstrate cache-aside read path (cache first, DB on miss, populate cache).
+- Keep Postgres as the single source of truth.
+- Invalidate cache on write/delete so stale single-entity reads are bounded.
+- Avoid cache dependency for list and search (partial cache cannot represent full datasets).
+- Paginate list and search responses to limit payload size.
+
+### Non-goals
+
+- Full cache mirroring of all products.
+- Caching list or search results.
+- Database index DDL beyond minimal app startup schema (search indexes are ops/infrastructure).
+- Authentication, rate limiting, or production hardening.
+
+---
+
+## 2. Architecture
+
+### 2.1 High-level diagram
+
+```
+                    ┌─────────────────────────────────────┐
+                    │           HTTP Client               │
+                    └──────────────────┬──────────────────┘
+                                       │ REST
+                    ┌──────────────────▼──────────────────┐
+                    │         ProductHandler                │
+                    │  (routes, JSON, status codes)         │
+                    └──────────────────┬──────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────┐
+                    │       ProductRepository               │
+                    │  (cache-aside logic, SQL, Redis)      │
+                    └───┬──────────────────────────┬────────┘
+                        │                          │
+           list/search  │                          │ get-by-id (cache-aside)
+           create       │                          │
+                        ▼                          ▼
+              ┌─────────────────┐        ┌─────────────────┐
+              │   PostgreSQL    │        │      Redis      │
+              │ (source of truth) │        │  (read cache)   │
+              └─────────────────┘        └─────────────────┘
+```
+
+### 2.2 Layer responsibilities
+
+| Layer | Package | Responsibility |
+|-------|---------|----------------|
+| Entry | `main` | Wire config, DB pool, Redis client, HTTP server, graceful shutdown |
+| Config | `internal/config` | Environment-backed settings (URLs, TTL, pagination defaults) |
+| Model | `internal/model` | Domain structs (`Product`, `ProductPage`) |
+| DB | `internal/db` | Postgres connection pool, minimal schema migration |
+| Cache | `internal/cache` | Redis Cluster client (`NewClusterClient`) |
+| Repository | `internal/repository` | Data access + cache-aside orchestration (bridge layer) |
+| Handler | `internal/handler` | REST API surface |
+
+The **repository** is the bridge between REST handlers and storage. Handlers never call Postgres or Redis directly. It owns:
+
+- When to read Redis vs Postgres.
+- SQL for list, search, and CRUD.
+- Cache key format, TTL on populate, and invalidation on write/delete.
+
+---
+
+## 3. Cache-Aside Pattern
+
+### 3.1 Definition
+
+In cache-aside, the application (not the database) manages the cache:
+
+1. **Read:** Check cache → on miss, read from DB → write to cache → return.
+2. **Write:** Update DB → invalidate (delete) the affected cache entry.
+3. **Create:** Write to DB only; cache is populated lazily on first read by ID.
+
+The cache is a **partial, lazy copy** of Postgres. Only products that have been fetched via `GET /products/{id}` may exist in Redis.
+
+### 3.2 Read by ID (`GetByID`)
+
+```
+GET /products/{id}
+        │
+        ▼
+   Redis GET product:{id}
+        │
+   ┌────┴────┐
+   │ hit     │ miss (or corrupt JSON)
+   ▼         ▼
+ return    Postgres SELECT by id
+            │
+            ▼
+       Redis SET product:{id} (TTL = 5 min)
+            │
+            ▼
+         return
+```
+
+### 3.3 Write paths
+
+| Operation | Postgres | Redis |
+|-----------|----------|-------|
+| `Create` | `INSERT` | No cache write |
+| `Update` | `UPDATE` | `DEL product:{id}` |
+| `Delete` | `DELETE` | `DEL product:{id}` |
+
+### 3.4 Why list/search skip the cache
+
+| Concern | Reason to use Postgres only |
+|---------|----------------------------|
+| Completeness | Cache only holds previously queried IDs |
+| New products | Visible in list immediately after `POST`, but not cached until first `GET` by ID |
+| Search (`ILIKE`) | Redis has no equivalent indexed query for name substring search |
+| Eviction | TTL or `maxmemory` LRU can remove keys; list must not depend on cache presence |
+| Pagination | `total` count must reflect full dataset or full match set in Postgres |
+
+---
+
+## 4. Data Model
+
+### 4.1 Domain entities
+
+```go
+type Product struct {
+    ID        int64
+    Name      string
+    Price     float64
+    CreatedAt time.Time
+}
+
+type ProductPage struct {
+    Items  []Product
+    Total  int       // full row count (list) or match count (search)
+    Limit  int       // page size applied
+    Offset int       // rows skipped
+}
+```
+
+### 4.2 Postgres schema (application migration)
+
+The app creates only the base table on startup. Index DDL for search is **out of scope** for this application (see §7).
+
+```sql
+CREATE TABLE products (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    price      DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### 4.3 Redis key format
+
+| Key | Value | TTL |
+|-----|-------|-----|
+| `product:{id}` | JSON-serialized `Product` | 5 minutes (`CacheTTL`) |
+
+Example: `product:42` → `{"id":42,"name":"Widget","price":9.99,"created_at":"..."}`
+
+---
+
+## 5. API Design
+
+Base URL: `http://localhost:8080` (configurable via `SERVER_ADDR`).
+
+### 5.1 Endpoints
+
+| Method | Path | Data source | Cache behavior |
+|--------|------|-------------|----------------|
+| `GET` | `/products` | Postgres | None |
+| `GET` | `/products?q={term}` | Postgres (`ILIKE` on name) | None |
+| `POST` | `/products` | Postgres | None |
+| `GET` | `/products/{id}` | Cache-aside | Read-through on miss |
+| `PUT` | `/products/{id}` | Postgres | Invalidate key |
+| `DELETE` | `/products/{id}` | Postgres | Invalidate key |
+
+List and search share `GET /products`. When `q` is present and non-empty, the handler routes to `Search`; otherwise `List`.
+
+### 5.2 Pagination
+
+Query parameters (both list and search):
+
+| Param | Default | Max / constraint | Source |
+|-------|---------|------------------|--------|
+| `limit` | `PAGE_DEFAULT_LIMIT` (20) | Capped at `PAGE_MAX_LIMIT` (100) | Config + query override |
+| `offset` | `PAGE_DEFAULT_OFFSET` (0) | Must be ≥ 0 | Config + query override |
+
+If `limit` or `offset` query params are invalid, the API returns `400 Bad Request`.
+
+**Important:** Pagination limits **response size**, not necessarily **query cost**. Postgres still finds matching rows before applying `LIMIT`/`OFFSET`. For search, index optimization is a database concern (§7).
+
+Response wrapper (`ProductPage`):
+
+```json
+{
+  "items": [
+    {"id": 1, "name": "Widget", "price": 9.99, "created_at": "..."}
+  ],
+  "total": 42,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+- `total` for list: `COUNT(*)` on `products`.
+- `total` for search: `COUNT(*)` where `name ILIKE '%term%'`.
+- Clients can compute pages: `next_offset = offset + limit`, `has_more = offset + len(items) < total`.
+
+### 5.3 Request / response examples
+
+**Create**
+
+```http
+POST /products
+Content-Type: application/json
+
+{"name": "Widget", "price": 9.99}
+```
+
+```http
+201 Created
+
+{"id": 1, "name": "Widget", "price": 9.99, "created_at": "..."}
+```
+
+**List (Postgres, paginated)**
+
+```http
+GET /products
+GET /products?limit=10&offset=20
+```
+
+```http
+200 OK
+
+{
+  "items": [...],
+  "total": 42,
+  "limit": 10,
+  "offset": 20
+}
+```
+
+**Search (Postgres, paginated)**
+
+```http
+GET /products?q=wid
+GET /products?q=widget&limit=5&offset=0
+```
+
+**Get by ID (cache-aside)**
+
+```http
+GET /products/1
+```
+
+First request: Postgres + cache populate. Subsequent requests within TTL: Redis.
+
+**Update (invalidate cache)**
+
+```http
+PUT /products/1
+Content-Type: application/json
+
+{"name": "Super Widget", "price": 14.99}
+```
+
+**Delete (invalidate cache)**
+
+```http
+DELETE /products/1
+```
+
+```http
+204 No Content
+```
+
+### 5.4 Error responses
+
+| Condition | Status |
+|-----------|--------|
+| Invalid JSON or missing fields | `400 Bad Request` |
+| Invalid `limit` or `offset` | `400 Bad Request` |
+| Product not found | `404 Not Found` |
+| Unsupported HTTP method | `405 Method Not Allowed` |
+| DB / cache errors | `500 Internal Server Error` |
+
+---
+
+## 6. Search Design
+
+### 6.1 Current implementation (application)
+
+Repository SQL (`internal/repository/product.go`):
+
+```sql
+-- count
+SELECT COUNT(*) FROM products WHERE name ILIKE '%' || $1 || '%'
+
+-- rows
+SELECT id, name, price, created_at FROM products
+WHERE name ILIKE '%' || $1 || '%'
+ORDER BY id
+LIMIT $2 OFFSET $3
+```
+
+Properties:
+
+- Substring, case-insensitive match on `name`.
+- Two round-trips per request (count + select).
+- Always Postgres; never Redis.
+- Paginated via shared `limit`/`offset` handling in the handler.
+
+### 6.2 Cost characteristics
+
+| Factor | Impact |
+|--------|--------|
+| Leading `%` in `ILIKE '%term%'` | B-tree index on `name` cannot be used |
+| `ILIKE` | Case-insensitive comparison on candidate rows |
+| `COUNT(*)` + `SELECT` | Two queries per search request |
+| Large match sets | Postgres must identify matches before `LIMIT` applies |
+
+Pagination reduces bytes over the wire but does **not** eliminate full scan cost without a supporting database index.
+
+### 6.3 Search index strategy (database side — out of app scope)
+
+**Chosen approach: Option A — trigram GIN index (`pg_trgm`)**
+
+Fits the current `ILIKE '%…%'` query shape. No application code changes required once the index exists.
+
+Reference DDL (applied by ops / separate migration tooling, **not** this app):
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS products_name_trgm_idx
+  ON products USING GIN (name gin_trgm_ops);
+```
+
+| Approach | Index | App SQL change | Fits current API |
+|----------|-------|----------------|------------------|
+| **A: Trigram GIN** (`pg_trgm`) | `GIN (name gin_trgm_ops)` | None | Yes — keeps `ILIKE '%term%'` |
+| B: Full-text (`tsvector`) | `GIN (to_tsvector(...))` | Yes — `@@ plainto_tsquery` | No — word search, not substring |
+| C: Prefix only | B-tree on `name` | Yes — `ILIKE term%` | No — prefix only |
+
+**Scope decision:** DDL and search indexes are beyond this application's scope. The app issues queries; Postgres uses indexes when present. Until `pg_trgm` is applied externally, search remains functionally correct but may scan sequentially at scale.
+
+### 6.4 Alternatives not used
+
+| Approach | Why not |
+|----------|---------|
+| Cache search results in Redis | Stale/partial results; list/search must stay authoritative |
+| Full-text search in app | Indexing belongs on the database |
+| External search (Elasticsearch) | Out of scope for this sample |
+
+---
+
+## 7. DDL & Migration Scope
+
+| DDL | Owned by | Notes |
+|-----|----------|-------|
+| `CREATE TABLE products` | App (`internal/db/postgres.go` on startup) | Minimal demo schema |
+| `pg_trgm` extension | Ops / external migrations | Search performance |
+| GIN trigram index on `name` | Ops / external migrations | Pairs with current `ILIKE` search |
+| Redis `maxmemory` policy | Docker / ops | Optional capacity eviction |
+
+The application does **not** manage production index lifecycle, backfills, or extension installs beyond the base table.
+
+---
+
+## 8. Cache Expiration & Eviction
+
+Two independent mechanisms affect Redis entries:
+
+### 8.1 Per-key TTL (application)
+
+- Set via `cache.Set(key, data, CacheTTL)` on cache miss in `GetByID`.
+- Default: **5 minutes** (`internal/config/config.go`).
+- Purpose: bound staleness if a write path fails to invalidate (defense in depth).
+
+### 8.2 Redis memory eviction (server, optional)
+
+- Not configured in default `docker-compose.yml`.
+- To enable LRU under memory pressure, set Redis `maxmemory` and `maxmemory-policy` (e.g. `volatile-lru` for keys with TTL).
+- Evicted keys cause a cache miss on the next `GET /products/{id}`; Postgres repopulates the cache.
+
+TTL expiration and LRU eviction are complementary: TTL controls time-based freshness; LRU controls capacity.
+
+---
+
+## 9. Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POSTGRES_URL` | `postgres://app:app@localhost:5432/appdb?sslmode=disable` | Postgres connection string |
+| `REDIS_CLUSTER_ADDRS` | `localhost:6379,localhost:6380,localhost:6381` | Comma-separated Redis Cluster node addresses |
+| `SERVER_ADDR` | `:8080` | HTTP listen address |
+| `CacheTTL` | `5m` (code default) | Redis key TTL on cache populate |
+| `PAGE_DEFAULT_LIMIT` | `20` | Default page size for list/search |
+| `PAGE_DEFAULT_OFFSET` | `0` | Default offset for list/search |
+| `PAGE_MAX_LIMIT` | `100` | Maximum allowed `limit` query param |
+
+Pagination defaults are loaded in config and passed into `ProductHandler`. Query params override defaults when valid.
+
+---
+
+## 10. Infrastructure
+
+### 10.1 Runtime components
+
+| Service | Image | Ports |
+|---------|-------|-------|
+| Postgres 16 | `postgres:16-alpine` | 5432 |
+| Redis Cluster | `redis:7-alpine` × 3 masters | 6379, 6380, 6381 |
+| Go app | local build | 8080 |
+
+Local Docker Compose runs a **3-master Redis Cluster** (no replicas). Nodes use `cluster-announce-ip` / `cluster-announce-port` so the app on the host can route via slot-aware client. A one-shot `redis-cluster-init` container forms the cluster on first start.
+
+The application uses `redis.NewClusterClient` (`go-redis`). The client computes key slots and routes `GET` / `SET` / `DEL` to the correct node; repository code only passes key names (e.g. `product:42`).
+
+Start dependencies:
+
+```bash
+docker compose up -d
+go run .
+```
+
+### 10.2 Dependencies (Go)
+
+| Package | Role |
+|---------|------|
+| `github.com/jackc/pgx/v5` | Postgres driver and connection pool |
+| `github.com/redis/go-redis/v9` | Redis client |
+
+---
+
+## 11. Request Flow Examples
+
+### 11.1 Repeated read by ID
+
+1. `GET /products/1` — Redis miss → Postgres → Redis SET (TTL 5m) → `200`.
+2. `GET /products/1` — Redis hit → `200` (no Postgres query).
+
+### 11.2 Create then list vs get
+
+1. `POST /products` — Postgres INSERT → `201`. Redis unchanged.
+2. `GET /products` — Postgres SELECT (paginated) → product appears in list.
+3. `GET /products/1` — Redis miss → Postgres → cache populate.
+
+### 11.3 Update invalidates cache
+
+1. `GET /products/1` — cached in Redis.
+2. `PUT /products/1` — Postgres UPDATE → Redis DEL `product:1`.
+3. `GET /products/1` — Redis miss → fresh read from Postgres → re-cache.
+
+### 11.4 Paginated search
+
+1. `GET /products?q=widget&limit=10&offset=0` — Postgres COUNT + SELECT (no Redis).
+2. `GET /products?q=widget&limit=10&offset=10` — next page from Postgres.
+3. `total` in response reflects all name matches, not just the current page.
+
+---
+
+## 12. Horizontal Scaling (Multiple App Instances)
+
+The application supports running **multiple instances** behind a load balancer. No code changes are required to scale horizontally.
+
+### 12.1 Architecture
+
+```
+                    Load balancer
+                         │
+        ┌────────────────┼────────────────┐
+        ▼                ▼                ▼
+    App instance 1   App instance 2   App instance 3
+    (ClusterClient)  (ClusterClient)  (ClusterClient)
+        │                │                │
+        └────────────────┼────────────────┘
+                         │
+              ┌──────────┴──────────┐
+              ▼                     ▼
+         PostgreSQL          Redis Cluster
+         (source of truth)   (shared cache)
+```
+
+Each instance is independent: own HTTP server, Postgres connection pool, and `ClusterClient` (with its own slot→node topology cache).
+
+### 12.2 Why multi-instance works
+
+| Layer | Behavior |
+|-------|----------|
+| HTTP handlers | Stateless — no in-memory session or per-request state |
+| Postgres | Shared system of record; each instance uses its own pool |
+| Redis Cluster | Shared external cache; all instances read/write the same keys |
+| Cache-aside | No in-process cache — coherence comes from shared Redis |
+
+| Scenario | Cross-instance behavior |
+|----------|-------------------------|
+| Instance A caches `product:1` | Instance B `GET /products/1` → Redis hit |
+| Instance B `PUT /products/1` → `DEL` | Instance A next read → miss → Postgres → re-cache |
+| Instance C `POST /products` | Visible in list/search on all instances immediately (Postgres) |
+
+Sticky sessions are **not** required.
+
+### 12.3 Per-instance requirements
+
+All instances must share:
+
+| Setting | Notes |
+|---------|-------|
+| `POSTGRES_URL` | Same database |
+| `REDIS_CLUSTER_ADDRS` | Same Redis Cluster |
+| Config defaults | Consistent `PAGE_*` and `CacheTTL` unless intentionally varied |
+
+Each instance may use its own `SERVER_ADDR` (e.g. `:8080` per container/pod).
+
+### 12.4 Redis Cluster client per instance
+
+Each process creates one `ClusterClient` via `cache.NewClusterClient`. Each client maintains its own slot→node topology map in memory. That is expected: topology is fetched from the cluster, not shared across processes.
+
+Repository code is unchanged — keys only (`product:{id}`); routing is internal to each client.
+
+### 12.5 Operational considerations
+
+| Topic | Note |
+|-------|------|
+| Startup migrations | Each instance runs `Migrate()` on boot (`CREATE TABLE IF NOT EXISTS` is safe here). Production should use a dedicated migration job for complex DDL. |
+| Connection limits | N instances × pool size = total Postgres and Redis connections — size pools accordingly. |
+| Cache stampede | Many instances cold-missing the same hot key can all query Postgres simultaneously — no singleflight yet (see §14). |
+| Load balancer | Any HTTP LB (round-robin, least-conn) works; no session affinity needed. |
+
+---
+
+## 13. Design Decisions & Trade-offs
+
+| Decision | Rationale |
+|----------|-----------|
+| Repository layer | Centralizes cache-aside rules; handlers stay HTTP-only |
+| Cache only `GetByID` | Hot-key optimization without mirroring full table |
+| List/search from Postgres | Correctness; cache is incomplete and unindexed for text queries |
+| Paginated list and search | Limits payload size; `total` enables client-side paging |
+| Pagination defaults in config | Consistent defaults across environments; overridable per request |
+| Invalidate on write, not write-through | Simpler; next read repopulates cache |
+| JSON in Redis | Human-readable, matches API response shape |
+| No cache on create | Lazy population avoids caching entities never read |
+| `ILIKE` search in Postgres | Simple substring search for demo API |
+| Search indexes outside app | DDL/index lifecycle is infrastructure, not application code |
+| Trigram GIN as reference index | Matches `ILIKE '%term%'` without app SQL changes |
+| Shared Redis for all app instances | Enables horizontal scale without per-process cache coherence issues |
+
+### Known limitations
+
+- Search can be expensive at scale without external `pg_trgm` index.
+- Pagination does not reduce search scan cost without database indexes.
+- String-based "not found" detection in handlers.
+- No distributed locking (cache stampede possible on cold keys across instances).
+- No metrics or structured logging.
+- `OFFSET` pagination degrades for very large offsets (keyset pagination not implemented).
+
+---
+
+## 14. Future Extensions
+
+- Redis `maxmemory` + `volatile-lru` in Docker Compose.
+- Interface-based repository for unit tests with mocks.
+- Cache stampede mitigation (singleflight or short-lived lock on miss).
+- Health endpoints (`/health`, `/ready`) checking Postgres and Redis.
+- OpenTelemetry traces across handler → repository → stores.
+- Keyset (cursor) pagination instead of `OFFSET` for large tables.
+- Minimum query length for search to reject trivial `q` values.
+- Full-text search (`tsvector`) if API moves to word-based search (requires SQL + index changes).
