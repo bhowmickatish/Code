@@ -8,7 +8,11 @@ import (
 	"time"
 )
 
+const DefaultAppEnv = "development"
+
 type Config struct {
+	AppEnv            string
+	IsDevelopmentMode bool
 	PostgresURL       string
 	RedisClusterAddrs []string
 	CacheTTL          time.Duration
@@ -32,7 +36,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	appEnv := envOrDefault("APP_ENV", DefaultAppEnv)
+
 	return Config{
+		AppEnv:            appEnv,
+		IsDevelopmentMode: appEnv == DefaultAppEnv,
 		PostgresURL:       envOrDefault("POSTGRES_URL", "postgres://app:app@localhost:5432/appdb?sslmode=disable"),
 		RedisClusterAddrs: envCSV("REDIS_CLUSTER_ADDRS", "localhost:6379,localhost:6380,localhost:6381"),
 		CacheTTL:          5 * time.Minute,

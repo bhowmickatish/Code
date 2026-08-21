@@ -58,7 +58,7 @@ The design optimizes **repeat reads of the same product** while keeping list and
 | Entry | `main` | Wire config, DB pool, Redis client, HTTP server, graceful shutdown |
 | Config | `internal/config` | Environment-backed settings (URLs, TTL, pagination defaults) |
 | Model | `internal/model` | Domain structs (`Product`, `ProductPage`) |
-| DB | `internal/db` | Postgres connection pool, minimal schema migration |
+| DB | `internal/db` | Postgres connection pool; dev-only schema migration |
 | Cache | `internal/cache` | Redis Cluster client (`NewClusterClient`) |
 | Repository | `internal/repository` | Data access + cache-aside orchestration (bridge layer) |
 | Handler | `internal/handler` | REST API surface |
@@ -111,7 +111,19 @@ GET /products/{id}
 | `Update` | `UPDATE` | `DEL product:{id}` |
 | `Delete` | `DELETE` | `DEL product:{id}` |
 
-### 3.4 Why list/search skip the cache
+### 3.4 Cache failure policy (fail-open)
+
+Postgres is the source of truth. Redis failures must not fail successful DB operations:
+
+| Operation | Redis failure | HTTP result |
+|-----------|---------------|-------------|
+| `GetByID` — cache `SET` after DB read | Logged; product still returned | `200` |
+| `Update` / `Delete` — cache `DEL` after DB write | Logged; DB change stands | `200` / `204` |
+| `GetByID` — cache `GET` error (not `Nil`) | Propagated | `500` |
+
+Stale cache entries are bounded by TTL if invalidation fails.
+
+### 3.5 Why list/search skip the cache
 
 | Concern | Reason to use Postgres only |
 |---------|----------------------------|
@@ -129,10 +141,10 @@ GET /products/{id}
 
 ```go
 type Product struct {
-    ID        int64
-    Name      string
-    Price     float64
-    CreatedAt time.Time
+    ID         int64
+    Name       string
+    PriceCents int64     // stored as integer cents to avoid floating-point money errors
+    CreatedAt  time.Time
 }
 
 type ProductPage struct {
@@ -143,15 +155,17 @@ type ProductPage struct {
 }
 ```
 
-### 4.2 Postgres schema (application migration)
+### 4.2 Postgres schema (development migration)
 
-The app creates only the base table on startup. Index DDL for search is **out of scope** for this application (see §7).
+The app runs `db.Migrate()` on startup **only when `IsDevelopmentMode` is true** (`APP_ENV=development`, the default). Production sets `APP_ENV=production` and applies DDL via a dedicated migration job.
+
+Migrate also upgrades legacy `price DOUBLE PRECISION` columns to `price_cents` when present.
 
 ```sql
 CREATE TABLE products (
     id         BIGSERIAL PRIMARY KEY,
     name       TEXT NOT NULL,
-    price      DOUBLE PRECISION NOT NULL,
+    price_cents BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
@@ -162,7 +176,7 @@ CREATE TABLE products (
 |-----|-------|-----|
 | `product:{id}` | JSON-serialized `Product` | 5 minutes (`CacheTTL`) |
 
-Example: `product:42` → `{"id":42,"name":"Widget","price":9.99,"created_at":"..."}`
+Example: `product:42` → `{"id":42,"name":"Widget","price_cents":999,"created_at":"..."}`
 
 ---
 
@@ -201,7 +215,7 @@ Response wrapper (`ProductPage`):
 ```json
 {
   "items": [
-    {"id": 1, "name": "Widget", "price": 9.99, "created_at": "..."}
+    {"id": 1, "name": "Widget", "price_cents": 999, "created_at": "..."}
   ],
   "total": 42,
   "limit": 20,
@@ -211,6 +225,7 @@ Response wrapper (`ProductPage`):
 
 - `total` for list: `COUNT(*)` on `products`.
 - `total` for search: `COUNT(*)` where `name ILIKE '%term%'`.
+- Empty pages return `"items": []` (never `null`).
 - Clients can compute pages: `next_offset = offset + limit`, `has_more = offset + len(items) < total`.
 
 ### 5.3 Request / response examples
@@ -221,13 +236,13 @@ Response wrapper (`ProductPage`):
 POST /products
 Content-Type: application/json
 
-{"name": "Widget", "price": 9.99}
+{"name": "Widget", "price_cents": 999}
 ```
 
 ```http
 201 Created
 
-{"id": 1, "name": "Widget", "price": 9.99, "created_at": "..."}
+{"id": 1, "name": "Widget", "price_cents": 999, "created_at": "..."}
 ```
 
 **List (Postgres, paginated)**
@@ -269,7 +284,7 @@ First request: Postgres + cache populate. Subsequent requests within TTL: Redis.
 PUT /products/1
 Content-Type: application/json
 
-{"name": "Super Widget", "price": 14.99}
+{"name": "Super Widget", "price_cents": 1499}
 ```
 
 **Delete (invalidate cache)**
@@ -286,11 +301,21 @@ DELETE /products/1
 
 | Condition | Status |
 |-----------|--------|
-| Invalid JSON or missing fields | `400 Bad Request` |
+| Invalid JSON, unknown fields, or body > 1 MiB | `400 Bad Request` |
+| Invalid `name` / `price_cents` | `400 Bad Request` |
+| Invalid product ID in path | `400 Bad Request` |
 | Invalid `limit` or `offset` | `400 Bad Request` |
-| Product not found | `404 Not Found` |
+| Product not found (`repository.ErrNotFound`) | `404 Not Found` |
 | Unsupported HTTP method | `405 Method Not Allowed` |
-| DB / cache errors | `500 Internal Server Error` |
+| DB read/write errors | `500 Internal Server Error` |
+| Redis read errors (not cache miss) | `500 Internal Server Error` |
+
+Not-found detection uses `errors.Is(err, repository.ErrNotFound)` — not string matching.
+
+### 5.5 Request validation
+
+- POST/PUT bodies: max **1 MiB** (`http.MaxBytesReader`), `DisallowUnknownFields()`.
+- `price_cents` must be a positive integer (no floats — avoids money rounding issues).
 
 ---
 
@@ -305,7 +330,7 @@ Repository SQL (`internal/repository/product.go`):
 SELECT COUNT(*) FROM products WHERE name ILIKE '%' || $1 || '%'
 
 -- rows
-SELECT id, name, price, created_at FROM products
+SELECT id, name, price_cents, created_at FROM products
 WHERE name ILIKE '%' || $1 || '%'
 ORDER BY id
 LIMIT $2 OFFSET $3
@@ -365,7 +390,7 @@ CREATE INDEX IF NOT EXISTS products_name_trgm_idx
 
 | DDL | Owned by | Notes |
 |-----|----------|-------|
-| `CREATE TABLE products` | App (`internal/db/postgres.go` on startup) | Minimal demo schema |
+| `CREATE TABLE products` | App when `IsDevelopmentMode` | Minimal demo schema via `db.Migrate()` |
 | `pg_trgm` extension | Ops / external migrations | Search performance |
 | GIN trigram index on `name` | Ops / external migrations | Pairs with current `ILIKE` search |
 | Redis `maxmemory` policy | Docker / ops | Optional capacity eviction |
@@ -398,6 +423,7 @@ TTL expiration and LRU eviction are complementary: TTL controls time-based fresh
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `APP_ENV` | `development` | Drives `IsDevelopmentMode`; when `development`, runs `db.Migrate()` on startup |
 | `POSTGRES_URL` | `postgres://app:app@localhost:5432/appdb?sslmode=disable` | Postgres connection string |
 | `REDIS_CLUSTER_ADDRS` | `localhost:6379,localhost:6380,localhost:6381` | Comma-separated Redis Cluster node addresses |
 | `SERVER_ADDR` | `:8080` | HTTP listen address |
@@ -418,7 +444,7 @@ Pagination defaults are loaded in config and passed into `ProductHandler`. Query
 |---------|-------|-------|
 | Postgres 16 | `postgres:16-alpine` | 5432 |
 | Redis Cluster | `redis:7-alpine` × 3 masters | 6379, 6380, 6381 |
-| Go app | local build | 8080 |
+| Go app | local build (Go 1.26+) | 8080 |
 
 Local Docker Compose runs a **3-master Redis Cluster** (no replicas). Nodes use `cluster-announce-ip` / `cluster-announce-port` so the app on the host can route via slot-aware client. A one-shot `redis-cluster-init` container forms the cluster on first start.
 
@@ -530,7 +556,7 @@ Repository code is unchanged — keys only (`product:{id}`); routing is internal
 
 | Topic | Note |
 |-------|------|
-| Startup migrations | Each instance runs `Migrate()` on boot (`CREATE TABLE IF NOT EXISTS` is safe here). Production should use a dedicated migration job for complex DDL. |
+| Startup migrations | `db.Migrate()` runs only when `IsDevelopmentMode` (`APP_ENV=development`). Production uses external migration tooling and `APP_ENV=production`. |
 | Connection limits | N instances × pool size = total Postgres and Redis connections — size pools accordingly. |
 | Cache stampede | Many instances cold-missing the same hot key can all query Postgres simultaneously — no singleflight yet (see §14). |
 | Load balancer | Any HTTP LB (round-robin, least-conn) works; no session affinity needed. |
@@ -551,17 +577,20 @@ Repository code is unchanged — keys only (`product:{id}`); routing is internal
 | No cache on create | Lazy population avoids caching entities never read |
 | `ILIKE` search in Postgres | Simple substring search for demo API |
 | Search indexes outside app | DDL/index lifecycle is infrastructure, not application code |
-| Trigram GIN as reference index | Matches `ILIKE '%term%'` without app SQL changes |
+| Integer `price_cents` | Exact money storage; no float drift in DB, cache, or API |
+| Cache fail-open on Redis write errors | Postgres result returned; TTL bounds staleness if invalidation fails |
+| `repository.ErrNotFound` sentinel | Reliable 404 mapping in handlers |
+| Dev-only auto-migrate (`IsDevelopmentMode`) | Local demo convenience; production DDL stays external |
 | Shared Redis for all app instances | Enables horizontal scale without per-process cache coherence issues |
 
 ### Known limitations
 
 - Search can be expensive at scale without external `pg_trgm` index.
 - Pagination does not reduce search scan cost without database indexes.
-- String-based "not found" detection in handlers.
 - No distributed locking (cache stampede possible on cold keys across instances).
-- No metrics or structured logging.
+- No structured metrics/tracing (cache/Redis failures are log-only).
 - `OFFSET` pagination degrades for very large offsets (keyset pagination not implemented).
+- Invalid `PAGE_*` env vars fail at startup; other misconfig may still go unnoticed.
 
 ---
 

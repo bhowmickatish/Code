@@ -29,8 +29,10 @@ func main() {
 	}
 	defer pool.Close()
 
-	if err := db.Migrate(ctx, pool); err != nil {
-		log.Fatalf("migrate: %v", err)
+	if cfg.IsDevelopmentMode {
+		if err := db.Migrate(ctx, pool); err != nil {
+			log.Fatalf("migrate: %v", err)
+		}
 	}
 
 	redisClient, err := cache.NewClusterClient(cfg.RedisClusterAddrs)
@@ -57,7 +59,7 @@ func main() {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Printf("listening on %s", cfg.ServerAddr)
+		log.Printf("APP_ENV=%s listening on %s", cfg.AppEnv, cfg.ServerAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			serverErr <- err
 		}
