@@ -56,26 +56,26 @@ func (r *ProductRepository) GetByID(ctx context.Context, id int64) (*model.Produ
 	return p, nil
 }
 
-func (r *ProductRepository) Create(ctx context.Context, name string, price float64) (*model.Product, error) {
+func (r *ProductRepository) Create(ctx context.Context, name string, priceCents int64) (*model.Product, error) {
 	var p model.Product
 	err := r.db.QueryRow(ctx,
-		`INSERT INTO products (name, price) VALUES ($1, $2)
-		 RETURNING id, name, price, created_at`,
-		name, price,
-	).Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt)
+		`INSERT INTO products (name, price_cents) VALUES ($1, $2)
+		 RETURNING id, name, price_cents, created_at`,
+		name, priceCents,
+	).Scan(&p.ID, &p.Name, &p.PriceCents, &p.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert product: %w", err)
 	}
 	return &p, nil
 }
 
-func (r *ProductRepository) Update(ctx context.Context, id int64, name string, price float64) (*model.Product, error) {
+func (r *ProductRepository) Update(ctx context.Context, id int64, name string, priceCents int64) (*model.Product, error) {
 	var p model.Product
 	err := r.db.QueryRow(ctx,
-		`UPDATE products SET name = $2, price = $3 WHERE id = $1
-		 RETURNING id, name, price, created_at`,
-		id, name, price,
-	).Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt)
+		`UPDATE products SET name = $2, price_cents = $3 WHERE id = $1
+		 RETURNING id, name, price_cents, created_at`,
+		id, name, priceCents,
+	).Scan(&p.ID, &p.Name, &p.PriceCents, &p.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -113,7 +113,7 @@ func (r *ProductRepository) List(ctx context.Context, limit, offset int) (model.
 	}
 
 	rows, err := r.db.Query(ctx,
-		`SELECT id, name, price, created_at FROM products ORDER BY id LIMIT $1 OFFSET $2`,
+		`SELECT id, name, price_cents, created_at FROM products ORDER BY id LIMIT $1 OFFSET $2`,
 		limit, offset,
 	)
 	if err != nil {
@@ -139,7 +139,7 @@ func (r *ProductRepository) Search(ctx context.Context, query string, limit, off
 	}
 
 	rows, err := r.db.Query(ctx,
-		`SELECT id, name, price, created_at FROM products
+		`SELECT id, name, price_cents, created_at FROM products
 		 WHERE name ILIKE '%' || $1 || '%' ORDER BY id LIMIT $2 OFFSET $3`,
 		query, limit, offset,
 	)
@@ -159,7 +159,7 @@ func scanProducts(rows pgx.Rows) ([]model.Product, error) {
 	products := make([]model.Product, 0)
 	for rows.Next() {
 		var p model.Product
-		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.PriceCents, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan product: %w", err)
 		}
 		products = append(products, p)
@@ -173,8 +173,8 @@ func scanProducts(rows pgx.Rows) ([]model.Product, error) {
 func (r *ProductRepository) getFromDB(ctx context.Context, id int64) (*model.Product, error) {
 	var p model.Product
 	err := r.db.QueryRow(ctx,
-		`SELECT id, name, price, created_at FROM products WHERE id = $1`, id,
-	).Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt)
+		`SELECT id, name, price_cents, created_at FROM products WHERE id = $1`, id,
+	).Scan(&p.ID, &p.Name, &p.PriceCents, &p.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound

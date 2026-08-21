@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -63,19 +62,19 @@ func (h *ProductHandler) handleProducts(w http.ResponseWriter, r *http.Request) 
 
 	case http.MethodPost:
 		var body struct {
-			Name  string  `json:"name"`
-			Price float64 `json:"price"`
+			Name       string `json:"name"`
+			PriceCents int64  `json:"price_cents"`
 		}
 		if err := decodeJSONBody(w, r, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := validateProductInput(body.Name, body.Price); err != nil {
+		if err := validateProductInput(body.Name, body.PriceCents); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		p, err := h.repo.Create(r.Context(), body.Name, body.Price)
+		p, err := h.repo.Create(r.Context(), body.Name, body.PriceCents)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -109,19 +108,19 @@ func (h *ProductHandler) handleProductByID(w http.ResponseWriter, r *http.Reques
 
 	case http.MethodPut:
 		var body struct {
-			Name  string  `json:"name"`
-			Price float64 `json:"price"`
+			Name       string `json:"name"`
+			PriceCents int64  `json:"price_cents"`
 		}
 		if err := decodeJSONBody(w, r, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := validateProductInput(body.Name, body.Price); err != nil {
+		if err := validateProductInput(body.Name, body.PriceCents); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		p, err := h.repo.Update(r.Context(), id, body.Name, body.Price)
+		p, err := h.repo.Update(r.Context(), id, body.Name, body.PriceCents)
 		if err != nil {
 			if errors.Is(err, repository.ErrNotFound) {
 				http.Error(w, repository.ErrNotFound.Error(), http.StatusNotFound)
@@ -182,12 +181,9 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 	return nil
 }
 
-func validateProductInput(name string, price float64) error {
-	if name == "" {
-		return fmt.Errorf("name and positive price are required")
-	}
-	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
-		return fmt.Errorf("name and positive price are required")
+func validateProductInput(name string, priceCents int64) error {
+	if name == "" || priceCents <= 0 {
+		return fmt.Errorf("name and positive price_cents are required")
 	}
 	return nil
 }
