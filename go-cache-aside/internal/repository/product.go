@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/atish/go-cache-aside/internal/model"
@@ -49,7 +50,7 @@ func (r *ProductRepository) GetByID(ctx context.Context, id int64) (*model.Produ
 		return p, nil
 	}
 	if err := r.cache.Set(ctx, key, data, r.cacheTTL).Err(); err != nil {
-		return p, fmt.Errorf("cache set: %w", err)
+		log.Printf("cache set %s: %v", key, err)
 	}
 
 	return p, nil
@@ -77,13 +78,13 @@ func (r *ProductRepository) Update(ctx context.Context, id int64, name string, p
 	).Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("product not found")
+			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("update product: %w", err)
 	}
 
 	if err := r.cache.Del(ctx, productKey(id)).Err(); err != nil {
-		return &p, fmt.Errorf("cache invalidate: %w", err)
+		log.Printf("cache invalidate %s: %v", productKey(id), err)
 	}
 
 	return &p, nil
@@ -95,11 +96,11 @@ func (r *ProductRepository) Delete(ctx context.Context, id int64) error {
 		return fmt.Errorf("delete product: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("product not found")
+		return ErrNotFound
 	}
 
 	if err := r.cache.Del(ctx, productKey(id)).Err(); err != nil {
-		return fmt.Errorf("cache invalidate: %w", err)
+		log.Printf("cache invalidate %s: %v", productKey(id), err)
 	}
 	return nil
 }
@@ -155,7 +156,7 @@ func (r *ProductRepository) Search(ctx context.Context, query string, limit, off
 }
 
 func scanProducts(rows pgx.Rows) ([]model.Product, error) {
-	var products []model.Product
+	products := make([]model.Product, 0)
 	for rows.Next() {
 		var p model.Product
 		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt); err != nil {
@@ -176,7 +177,7 @@ func (r *ProductRepository) getFromDB(ctx context.Context, id int64) (*model.Pro
 	).Scan(&p.ID, &p.Name, &p.Price, &p.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("product not found")
+			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("query product: %w", err)
 	}

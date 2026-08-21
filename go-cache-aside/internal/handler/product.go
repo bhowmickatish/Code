@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -91,8 +92,8 @@ func (h *ProductHandler) handleProductByID(w http.ResponseWriter, r *http.Reques
 	case http.MethodGet:
 		p, err := h.repo.GetByID(r.Context(), id)
 		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				http.Error(w, err.Error(), http.StatusNotFound)
+			if errors.Is(err, repository.ErrNotFound) {
+				http.Error(w, repository.ErrNotFound.Error(), http.StatusNotFound)
 				return
 			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -116,8 +117,8 @@ func (h *ProductHandler) handleProductByID(w http.ResponseWriter, r *http.Reques
 
 		p, err := h.repo.Update(r.Context(), id, body.Name, body.Price)
 		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				http.Error(w, err.Error(), http.StatusNotFound)
+			if errors.Is(err, repository.ErrNotFound) {
+				http.Error(w, repository.ErrNotFound.Error(), http.StatusNotFound)
 				return
 			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -127,8 +128,8 @@ func (h *ProductHandler) handleProductByID(w http.ResponseWriter, r *http.Reques
 
 	case http.MethodDelete:
 		if err := h.repo.Delete(r.Context(), id); err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				http.Error(w, err.Error(), http.StatusNotFound)
+			if errors.Is(err, repository.ErrNotFound) {
+				http.Error(w, repository.ErrNotFound.Error(), http.StatusNotFound)
 				return
 			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
