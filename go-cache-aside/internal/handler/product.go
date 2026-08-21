@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +13,10 @@ import (
 	"github.com/atish/go-cache-aside/internal/model"
 	"github.com/atish/go-cache-aside/internal/repository"
 )
+
+const maxRequestBodyBytes = 1 << 20 // 1 MiB
+
+var errInvalidProductID = errors.New("invalid product id")
 
 type ProductHandler struct {
 	repo              *repository.ProductRepository
@@ -60,12 +66,12 @@ func (h *ProductHandler) handleProducts(w http.ResponseWriter, r *http.Request) 
 			Name  string  `json:"name"`
 			Price float64 `json:"price"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		if err := decodeJSONBody(w, r, &body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if body.Name == "" || body.Price <= 0 {
-			http.Error(w, "name and positive price are required", http.StatusBadRequest)
+		if err := validateProductInput(body.Name, body.Price); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -106,12 +112,12 @@ func (h *ProductHandler) handleProductByID(w http.ResponseWriter, r *http.Reques
 			Name  string  `json:"name"`
 			Price float64 `json:"price"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		if err := decodeJSONBody(w, r, &body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if body.Name == "" || body.Price <= 0 {
-			http.Error(w, "name and positive price are required", http.StatusBadRequest)
+		if err := validateProductInput(body.Name, body.Price); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -166,16 +172,42 @@ func (h *ProductHandler) parsePagination(r *http.Request) (limit, offset int, er
 	return limit, offset, nil
 }
 
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON body")
+	}
+	return nil
+}
+
+func validateProductInput(name string, price float64) error {
+	if name == "" {
+		return fmt.Errorf("name and positive price are required")
+	}
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return fmt.Errorf("name and positive price are required")
+	}
+	return nil
+}
+
 func parseID(path string) (int64, error) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) != 2 || parts[0] != "products" {
-		return 0, strconv.ErrSyntax
+		return 0, errInvalidProductID
 	}
-	return strconv.ParseInt(parts[1], 10, 64)
+	id, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || id < 1 {
+		return 0, errInvalidProductID
+	}
+	return id, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("write json response: %v", err)
+	}
 }

@@ -17,7 +17,10 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
 	ctx := context.Background()
 
 	pool, err := db.NewPool(ctx, cfg.PostgresURL)
@@ -49,16 +52,23 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("listening on %s", cfg.ServerAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server: %v", err)
+			serverErr <- err
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	select {
+	case sig := <-stop:
+		log.Printf("shutting down: %v", sig)
+	case err := <-serverErr:
+		log.Printf("server error: %v", err)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
