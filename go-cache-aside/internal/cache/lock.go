@@ -18,27 +18,36 @@ func LockKey(cacheKey string) string {
 	return lockKeyPrefix + cacheKey
 }
 
-func TryAcquireLock(ctx context.Context, client redis.UniversalClient, lockKey string, ttl time.Duration) (token string, acquired bool, err error) {
-	token, err = randomToken()
+// Lock is a Redis token lock acquired with SET NX EX.
+type Lock struct {
+	client redis.UniversalClient
+	key    string
+	token  string
+}
+
+// TryAcquireLock attempts SET key token NX EX ttl. On success, returns a Lock that must be released.
+func TryAcquireLock(ctx context.Context, client redis.UniversalClient, lockKey string, ttl time.Duration) (lock *Lock, acquired bool, err error) {
+	token, err := randomToken()
 	if err != nil {
-		return "", false, err
+		return nil, false, err
 	}
 	acquired, err = client.SetNX(ctx, lockKey, token, ttl).Result()
 	if err != nil {
-		return "", false, err
+		return nil, false, err
 	}
-	return token, acquired, nil
+	if !acquired {
+		return nil, false, nil
+	}
+	return &Lock{client: client, key: lockKey, token: token}, true, nil
 }
 
-var releaseLockScript = redis.NewScript(`
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-	return redis.call("DEL", KEYS[1])
-end
-return 0
-`)
-
-func ReleaseLock(ctx context.Context, client redis.UniversalClient, lockKey, token string) error {
-	return releaseLockScript.Run(ctx, client, []string{lockKey}, token).Err()
+// Release deletes the lock key only when this holder's token still matches.
+func (l *Lock) Release(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	_, err := releaseLockScript.Run(ctx, l.client, []string{l.key}, l.token).Result()
+	return err
 }
 
 func WaitForCache(ctx context.Context, client redis.UniversalClient, key string, maxWait, poll time.Duration) ([]byte, error) {

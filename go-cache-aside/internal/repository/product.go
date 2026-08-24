@@ -85,7 +85,7 @@ func (r *ProductRepository) loadThroughGates(ctx context.Context, id int64, cach
 	}
 
 	lockKey := cache.LockKey(cacheKey)
-	token, acquired, err := cache.TryAcquireLock(ctx, r.cache, lockKey, r.cacheLockTTL)
+	lock, acquired, err := cache.TryAcquireLock(ctx, r.cache, lockKey, r.cacheLockTTL)
 	if err != nil {
 		log.Printf("cache lock acquire %s: %v", lockKey, err)
 		return r.loadAndCache(ctx, id, cacheKey)
@@ -93,7 +93,7 @@ func (r *ProductRepository) loadThroughGates(ctx context.Context, id int64, cach
 
 	if acquired {
 		defer func() {
-			if err := cache.ReleaseLock(ctx, r.cache, lockKey, token); err != nil {
+			if err := lock.Release(ctx); err != nil {
 				log.Printf("cache lock release %s: %v", lockKey, err)
 			}
 		}()
