@@ -85,6 +85,11 @@ The cache is a **partial, lazy copy** of Postgres. Only products that have been 
 
 ### 3.2 Read by ID (`GetByID`)
 
+Cache misses use a two-gate stampede mitigation path before hitting Postgres:
+
+1. **Gate 1 — `singleflight` (per process):** one in-flight load per product ID per instance.
+2. **Gate 2 — Redis lock (cross-instance):** `SET lock:product:{id} NX EX`; one loader globally; waiters poll cache.
+
 ```
 GET /products/{id}
         │
@@ -94,14 +99,30 @@ GET /products/{id}
    ┌────┴────┐
    │ hit     │ miss (or corrupt JSON)
    ▼         ▼
- return    Postgres SELECT by id
+ return    Gate 1: singleflight.Do (per instance)
             │
             ▼
-       Redis SET product:{id} (TTL = 5 min)
+       Gate 2: SET lock:product:{id} NX
             │
-            ▼
-         return
+     ┌──────┴──────┐
+     │ acquired    │ not acquired
+     ▼             ▼
+  double-check   poll GET product:{id}
+  cache          until populated or timeout
+     │             │
+     ▼             ▼
+  Postgres       return cached (or fallback load)
+  SELECT
+     │
+     ▼
+  Redis SET product:{id} (TTL = 5 min)
+  DEL lock:product:{id}
+     │
+     ▼
+  return
 ```
+
+Lock/wait failures fail open: load from Postgres without blocking the request.
 
 ### 3.3 Write paths
 
@@ -428,6 +449,9 @@ TTL expiration and LRU eviction are complementary: TTL controls time-based fresh
 | `REDIS_CLUSTER_ADDRS` | `localhost:6379,localhost:6380,localhost:6381` | Comma-separated Redis Cluster node addresses |
 | `SERVER_ADDR` | `:8080` | HTTP listen address |
 | `CacheTTL` | `5m` (code default) | Redis key TTL on cache populate |
+| `CACHE_LOCK_TTL` | `10s` | Redis lock auto-expire if loader crashes |
+| `CACHE_LOCK_MAX_WAIT` | `3s` | Max time lock waiters poll cache before fallback load |
+| `CACHE_LOCK_POLL_INTERVAL` | `50ms` | Poll interval while waiting for cache populate |
 | `PAGE_DEFAULT_LIMIT` | `20` | Default page size for list/search |
 | `PAGE_DEFAULT_OFFSET` | `0` | Default offset for list/search |
 | `PAGE_MAX_LIMIT` | `100` | Maximum allowed `limit` query param |
@@ -558,7 +582,7 @@ Repository code is unchanged — keys only (`product:{id}`); routing is internal
 |-------|------|
 | Startup migrations | `db.Migrate()` runs only when `IsDevelopmentMode` (`APP_ENV=development`). Production uses external migration tooling and `APP_ENV=production`. |
 | Connection limits | N instances × pool size = total Postgres and Redis connections — size pools accordingly. |
-| Cache stampede | Many instances cold-missing the same hot key can all query Postgres simultaneously — no singleflight yet (see §14). |
+| Cache stampede | Mitigated via `singleflight` (per instance) + Redis lock on miss (cross-instance); see §3.2. |
 | Load balancer | Any HTTP LB (round-robin, least-conn) works; no session affinity needed. |
 
 ---
@@ -587,7 +611,7 @@ Repository code is unchanged — keys only (`product:{id}`); routing is internal
 
 - Search can be expensive at scale without external `pg_trgm` index.
 - Pagination does not reduce search scan cost without database indexes.
-- No distributed locking (cache stampede possible on cold keys across instances).
+- Lock wait timeout can cause a rare duplicate Postgres read (fail-open fallback).
 - No structured metrics/tracing (cache/Redis failures are log-only).
 - `OFFSET` pagination degrades for very large offsets (keyset pagination not implemented).
 - Invalid `PAGE_*` env vars fail at startup; other misconfig may still go unnoticed.
@@ -596,9 +620,8 @@ Repository code is unchanged — keys only (`product:{id}`); routing is internal
 
 ## 14. Future Extensions
 
-- Redis `maxmemory` + `volatile-lru` in Docker Compose.
 - Interface-based repository for unit tests with mocks.
-- Cache stampede mitigation (singleflight or short-lived lock on miss).
+- Proactive TTL refresh for a predefined hot-key set (optional second-layer optimization).
 - Health endpoints (`/health`, `/ready`) checking Postgres and Redis.
 - OpenTelemetry traces across handler → repository → stores.
 - Keyset (cursor) pagination instead of `OFFSET` for large tables.

@@ -11,15 +11,18 @@ import (
 const DefaultAppEnv = "development"
 
 type Config struct {
-	AppEnv            string
-	IsDevelopmentMode bool
-	PostgresURL       string
-	RedisClusterAddrs []string
-	CacheTTL          time.Duration
-	ServerAddr        string
-	PageDefaultLimit  int
-	PageDefaultOffset int
-	PageMaxLimit      int
+	AppEnv                string
+	IsDevelopmentMode     bool
+	PostgresURL           string
+	RedisClusterAddrs     []string
+	CacheTTL              time.Duration
+	CacheLockTTL          time.Duration
+	CacheLockMaxWait      time.Duration
+	CacheLockPollInterval time.Duration
+	ServerAddr            string
+	PageDefaultLimit      int
+	PageDefaultOffset     int
+	PageMaxLimit          int
 }
 
 func Load() (Config, error) {
@@ -36,18 +39,34 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	cacheLockTTL, err := envDuration("CACHE_LOCK_TTL", 10*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	cacheLockMaxWait, err := envDuration("CACHE_LOCK_MAX_WAIT", 3*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	cacheLockPollInterval, err := envDuration("CACHE_LOCK_POLL_INTERVAL", 50*time.Millisecond)
+	if err != nil {
+		return Config{}, err
+	}
+
 	appEnv := envOrDefault("APP_ENV", DefaultAppEnv)
 
 	return Config{
-		AppEnv:            appEnv,
-		IsDevelopmentMode: appEnv == DefaultAppEnv,
-		PostgresURL:       envOrDefault("POSTGRES_URL", "postgres://app:app@localhost:5432/appdb?sslmode=disable"),
-		RedisClusterAddrs: envCSV("REDIS_CLUSTER_ADDRS", "localhost:6379,localhost:6380,localhost:6381"),
-		CacheTTL:          5 * time.Minute,
-		ServerAddr:        envOrDefault("SERVER_ADDR", ":8080"),
-		PageDefaultLimit:  pageDefaultLimit,
-		PageDefaultOffset: pageDefaultOffset,
-		PageMaxLimit:      pageMaxLimit,
+		AppEnv:                appEnv,
+		IsDevelopmentMode:     appEnv == DefaultAppEnv,
+		PostgresURL:           envOrDefault("POSTGRES_URL", "postgres://app:app@localhost:5432/appdb?sslmode=disable"),
+		RedisClusterAddrs:     envCSV("REDIS_CLUSTER_ADDRS", "localhost:6379,localhost:6380,localhost:6381"),
+		CacheTTL:              5 * time.Minute,
+		CacheLockTTL:          cacheLockTTL,
+		CacheLockMaxWait:      cacheLockMaxWait,
+		CacheLockPollInterval: cacheLockPollInterval,
+		ServerAddr:            envOrDefault("SERVER_ADDR", ":8080"),
+		PageDefaultLimit:      pageDefaultLimit,
+		PageDefaultOffset:     pageDefaultOffset,
+		PageMaxLimit:          pageMaxLimit,
 	}, nil
 }
 
@@ -68,6 +87,18 @@ func envInt(key string, fallback int) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer", key)
 	}
 	return n, nil
+}
+
+func envDuration(key string, fallback time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a duration (e.g. 10s, 50ms)", key)
+	}
+	return d, nil
 }
 
 func envCSV(key, fallback string) []string {

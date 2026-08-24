@@ -41,7 +41,14 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	repo := repository.NewProductRepository(pool, redisClient, cfg.CacheTTL)
+	repo := repository.NewProductRepository(
+		pool,
+		redisClient,
+		cfg.CacheTTL,
+		cfg.CacheLockTTL,
+		cfg.CacheLockMaxWait,
+		cfg.CacheLockPollInterval,
+	)
 	productHandler := handler.NewProductHandler(repo, cfg.PageDefaultLimit, cfg.PageDefaultOffset, cfg.PageMaxLimit)
 
 	mux := http.NewServeMux()

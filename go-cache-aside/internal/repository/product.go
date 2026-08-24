@@ -6,40 +6,148 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
+	"github.com/atish/go-cache-aside/internal/cache"
 	"github.com/atish/go-cache-aside/internal/model"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
 
 const productKeyPrefix = "product:"
 
 type ProductRepository struct {
-	db       *pgxpool.Pool
-	cache    redis.UniversalClient
-	cacheTTL time.Duration
+	db                *pgxpool.Pool
+	cache             redis.UniversalClient
+	cacheTTL          time.Duration
+	cacheLockTTL      time.Duration
+	cacheLockMaxWait  time.Duration
+	cacheLockPoll     time.Duration
+	loadGroup         singleflight.Group
 }
 
-func NewProductRepository(db *pgxpool.Pool, cache redis.UniversalClient, cacheTTL time.Duration) *ProductRepository {
-	return &ProductRepository{db: db, cache: cache, cacheTTL: cacheTTL}
+func NewProductRepository(
+	db *pgxpool.Pool,
+	cache redis.UniversalClient,
+	cacheTTL, cacheLockTTL, cacheLockMaxWait, cacheLockPoll time.Duration,
+) *ProductRepository {
+	return &ProductRepository{
+		db:               db,
+		cache:            cache,
+		cacheTTL:         cacheTTL,
+		cacheLockTTL:     cacheLockTTL,
+		cacheLockMaxWait: cacheLockMaxWait,
+		cacheLockPoll:    cacheLockPoll,
+	}
 }
 
 func (r *ProductRepository) GetByID(ctx context.Context, id int64) (*model.Product, error) {
 	key := productKey(id)
 
-	cached, err := r.cache.Get(ctx, key).Bytes()
-	if err == nil {
-		var p model.Product
-		if err := json.Unmarshal(cached, &p); err == nil {
-			return &p, nil
-		}
+	p, ok, err := r.getFromCache(ctx, key)
+	if err != nil {
+		return nil, err
 	}
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return nil, fmt.Errorf("cache get: %w", err)
+	if ok {
+		return p, nil
 	}
 
+	flightKey := strconv.FormatInt(id, 10)
+	ch := r.loadGroup.DoChan(flightKey, func() (any, error) {
+		loadCtx, cancel := context.WithTimeout(context.Background(), r.cacheLockMaxWait+r.cacheLockTTL)
+		defer cancel()
+		return r.loadThroughGates(loadCtx, id, key)
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		p, ok := res.Val.(*model.Product)
+		if !ok {
+			return nil, fmt.Errorf("unexpected load result for product %d", id)
+		}
+		return p, nil
+	}
+}
+
+func (r *ProductRepository) loadThroughGates(ctx context.Context, id int64, cacheKey string) (*model.Product, error) {
+	if p, ok, err := r.getFromCache(ctx, cacheKey); err != nil {
+		return nil, err
+	} else if ok {
+		return p, nil
+	}
+
+	lockKey := cache.LockKey(cacheKey)
+	token, acquired, err := cache.TryAcquireLock(ctx, r.cache, lockKey, r.cacheLockTTL)
+	if err != nil {
+		log.Printf("cache lock acquire %s: %v", lockKey, err)
+		return r.loadAndCache(ctx, id, cacheKey)
+	}
+
+	if acquired {
+		defer func() {
+			if err := cache.ReleaseLock(ctx, r.cache, lockKey, token); err != nil {
+				log.Printf("cache lock release %s: %v", lockKey, err)
+			}
+		}()
+
+		if p, ok, err := r.getFromCache(ctx, cacheKey); err != nil {
+			return nil, err
+		} else if ok {
+			return p, nil
+		}
+
+		return r.loadAndCache(ctx, id, cacheKey)
+	}
+
+	data, err := cache.WaitForCache(ctx, r.cache, cacheKey, r.cacheLockMaxWait, r.cacheLockPoll)
+	if err == nil {
+		return r.unmarshalProduct(data)
+	}
+	if !errors.Is(err, cache.ErrWaitTimeout) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		log.Printf("cache wait %s: %v", cacheKey, err)
+	}
+
+	if p, ok, err := r.getFromCache(ctx, cacheKey); err != nil {
+		return nil, err
+	} else if ok {
+		return p, nil
+	}
+
+	return r.loadAndCache(ctx, id, cacheKey)
+}
+
+func (r *ProductRepository) getFromCache(ctx context.Context, key string) (*model.Product, bool, error) {
+	cached, err := r.cache.Get(ctx, key).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("cache get: %w", err)
+	}
+	p, err := r.unmarshalProduct(cached)
+	if err != nil {
+		return nil, false, nil
+	}
+	return p, true, nil
+}
+
+func (r *ProductRepository) unmarshalProduct(data []byte) (*model.Product, error) {
+	var p model.Product
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, fmt.Errorf("cache unmarshal: %w", err)
+	}
+	return &p, nil
+}
+
+func (r *ProductRepository) loadAndCache(ctx context.Context, id int64, key string) (*model.Product, error) {
 	p, err := r.getFromDB(ctx, id)
 	if err != nil {
 		return nil, err
