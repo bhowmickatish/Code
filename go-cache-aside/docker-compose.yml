@@ -28,6 +28,10 @@ services:
       - "5000"
       - --appendonly
       - "yes"
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - volatile-lru
       - --bind
       - "0.0.0.0"
       - --cluster-announce-ip
@@ -55,6 +59,10 @@ services:
       - "5000"
       - --appendonly
       - "yes"
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - volatile-lru
       - --bind
       - "0.0.0.0"
       - --cluster-announce-ip
@@ -82,6 +90,10 @@ services:
       - "5000"
       - --appendonly
       - "yes"
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - volatile-lru
       - --bind
       - "0.0.0.0"
       - --cluster-announce-ip
