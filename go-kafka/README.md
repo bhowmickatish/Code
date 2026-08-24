@@ -9,6 +9,7 @@ A minimal Go sample demonstrating Kafka producer and consumer patterns with topi
 - **Partitions** — topic created with configurable partition count (default 6)
 - **Keyed routing** — `Murmur2Balancer` maps keys to partitions (Java/librdkafka compatible)
 - **Parallelism** — run multiple consumer instances in the same group; Kafka assigns one partition per consumer (up to partition count)
+- **Backpressure** — bounded producer queue and consumer in-flight limits
 
 ## Prerequisites
 
@@ -86,6 +87,10 @@ Run:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-partitions` | `6` | Partitions when creating the topic |
+| `-queue` | `0` | Bounded producer queue size (`0` = sync direct write) |
+| `-try-write` | `false` | Return immediately with backpressure when queue is full or lag is high |
+| `-max-lag` | `0` | Max consumer group lag before backpressure (`0` = disabled) |
+| `-lag-poll` | `10s` | How often to refresh consumer lag from Kafka |
 
 **Consumer**
 
@@ -93,6 +98,46 @@ Run:
 |------|---------|-------------|
 | `-id` | `consumer-1` | Unique instance ID for logging |
 | `-delay` | `500ms` | Simulated processing time per message |
+| `-max-inflight` | `1` | Max concurrent messages before fetch blocks |
+| `-queue-capacity` | `2` | Max messages prefetched by the kafka reader |
+
+## Backpressure
+
+### Producer
+
+`Producer.Write` with `-queue N` enqueues to a bounded buffer. When the buffer is full, the caller blocks until the background worker drains it.
+
+```powershell
+go run ./cmd/producer -queue 50
+```
+
+With `-try-write`, a full queue returns `ErrBackpressure` instead of blocking:
+
+```powershell
+go run ./cmd/producer -queue 10 -try-write
+```
+
+### Consumer lag gate
+
+When `-max-lag` is set, the producer polls `ListOffsets` + `OffsetFetch` for the consumer group and blocks (or rejects with `-try-write`) when lag is too high:
+
+```powershell
+# Terminal 1: slow consumer
+go run ./cmd/consumer -delay 5s
+
+# Terminal 2: producer rejects when lag > 10
+go run ./cmd/producer -max-lag 10 -try-write
+```
+
+### Consumer
+
+`Consumer.Consume` acquires a slot before each `Fetch`. When `max-inflight` workers are busy, fetching stops until one completes — processing speed governs consumption.
+
+```powershell
+go run ./cmd/consumer -max-inflight 5 -queue-capacity 2
+```
+
+Lower `-queue-capacity` reduces prefetch and applies tighter backpressure from the broker.
 
 ## Architecture
 
@@ -142,8 +187,10 @@ go-kafka/
 │   ├── topic.go        # Topic creation
 │   ├── partition.go    # Murmur2 partition helper
 │   ├── message.go      # Record and Header types
-│   ├── producer.go     # Producer wrapper
-│   └── consumer.go     # Consumer wrapper
+│   ├── producer.go     # Producer wrapper (bounded queue)
+│   ├── consumer.go     # Consumer wrapper (in-flight limits)
+│   ├── lag.go          # GroupLag + lag monitor
+│   └── errors.go       # ErrBackpressure, ErrConsumerLag
 ├── scripts/
 │   └── run-consumers.ps1
 ├── docker-compose.yml

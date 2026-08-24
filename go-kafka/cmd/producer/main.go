@@ -24,18 +24,31 @@ type OrderEvent struct {
 
 func main() {
 	partitions := flag.Int("partitions", kafkapkg.PartitionCount(), "number of topic partitions")
+	queueSize := flag.Int("queue", 0, "bounded producer queue size (0 = sync direct write)")
+	nonBlocking := flag.Bool("try-write", false, "reject immediately when producer queue is full or lag is high")
+	maxLag := flag.Int64("max-lag", 0, "max consumer group lag before backpressure (0 = disabled)")
+	lagPoll := flag.Duration("lag-poll", 10*time.Second, "how often to refresh consumer lag from Kafka")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	producer, err := kafkapkg.NewProducer(ctx, *partitions)
+	producer, err := kafkapkg.NewProducerWithConfig(ctx, kafkapkg.ProducerConfig{
+		Partitions:      *partitions,
+		QueueSize:       *queueSize,
+		MaxLag:            *maxLag,
+		LagPollInterval:   *lagPoll,
+		LagGroupID:        kafkapkg.GroupID,
+	})
 	if err != nil {
 		log.Fatalf("create producer: %v", err)
 	}
 	defer producer.Close()
 
-	log.Printf("topic %q ready with %d partitions", kafkapkg.Topic, *partitions)
+	log.Printf(
+		"topic %q ready with %d partitions (queue=%d, max_lag=%d, lag_poll=%s)",
+		kafkapkg.Topic, *partitions, *queueSize, *maxLag, *lagPoll,
+	)
 
 	for i := 1; ; i++ {
 		select {
@@ -59,12 +72,29 @@ func main() {
 		}
 
 		key := []byte(event.ProductID)
-		partition, err := producer.Write(ctx, key, payload,
-			kafkapkg.Header{Key: "content-type", Value: []byte("application/json")},
-			kafkapkg.Header{Key: "schema-version", Value: []byte(strconv.Itoa(1))},
-		)
+		headers := []kafkapkg.Header{
+			{Key: "content-type", Value: []byte("application/json")},
+			{Key: "schema-version", Value: []byte(strconv.Itoa(1))},
+		}
+
+		var partition int
+		if *nonBlocking {
+			partition, err = producer.TryWrite(ctx, key, payload, headers...)
+		} else {
+			partition, err = producer.Write(ctx, key, payload, headers...)
+		}
 		if err != nil {
-			log.Fatalf("publish: %v", err)
+			switch err {
+			case kafkapkg.ErrBackpressure:
+				log.Printf("backpressure: queue full, retrying order=%s", event.OrderID)
+			case kafkapkg.ErrConsumerLag:
+				log.Printf("backpressure: consumer lag high, retrying order=%s", event.OrderID)
+			default:
+				log.Fatalf("publish: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			i--
+			continue
 		}
 
 		log.Printf("produced order=%s product=%s partition=%d", event.OrderID, event.ProductID, partition)
