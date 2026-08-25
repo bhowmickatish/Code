@@ -2,6 +2,8 @@
 
 A minimal Go sample demonstrating Kafka producer and consumer patterns with topic partitions and consumer group parallelism.
 
+See [DESIGN.md](./DESIGN.md) for full architecture and design decisions.
+
 ## Features
 
 - **Producer** — publishes JSON `OrderEvent` messages keyed by `product_id`
@@ -140,6 +142,8 @@ go run ./cmd/consumer -max-inflight 5 -queue-capacity 2
 Lower `-queue-capacity` reduces prefetch and applies tighter backpressure from the broker.
 
 ## Architecture
+
+See [DESIGN.md §2](./DESIGN.md#2-architecture) for diagrams, layer responsibilities, and end-to-end flows.
 
 ```
 Producer (cmd/producer)
