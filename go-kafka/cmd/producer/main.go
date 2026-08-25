@@ -36,9 +36,9 @@ func main() {
 	producer, err := kafkapkg.NewProducerWithConfig(ctx, kafkapkg.ProducerConfig{
 		Partitions:      *partitions,
 		QueueSize:       *queueSize,
-		MaxLag:            *maxLag,
-		LagPollInterval:   *lagPoll,
-		LagGroupID:        kafkapkg.GroupID,
+		MaxLag:          *maxLag,
+		LagPollInterval: *lagPoll,
+		LagGroupID:      kafkapkg.GroupID,
 	})
 	if err != nil {
 		log.Fatalf("create producer: %v", err)

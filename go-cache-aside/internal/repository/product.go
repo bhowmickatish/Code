@@ -20,14 +20,14 @@ import (
 const productKeyPrefix = "product:"
 
 type ProductRepository struct {
-	db                *pgxpool.Pool
-	cache             redis.UniversalClient
-	cacheTTL          time.Duration
-	idempotencyTTL    time.Duration
-	cacheLockTTL      time.Duration
-	cacheLockMaxWait  time.Duration
-	cacheLockPoll     time.Duration
-	loadGroup         singleflight.Group
+	db               *pgxpool.Pool
+	cache            redis.UniversalClient
+	cacheTTL         time.Duration
+	idempotencyTTL   time.Duration
+	cacheLockTTL     time.Duration
+	cacheLockMaxWait time.Duration
+	cacheLockPoll    time.Duration
+	loadGroup        singleflight.Group
 }
 
 func NewProductRepository(
