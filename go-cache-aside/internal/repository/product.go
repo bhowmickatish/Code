@@ -109,7 +109,7 @@ func (r *ProductRepository) loadThroughGates(ctx context.Context, id int64, cach
 		return r.loadAndCache(ctx, id, cacheKey)
 	}
 
-	data, err := cache.WaitForCache(ctx, r.cache, cacheKey, r.cacheLockMaxWait, r.cacheLockPoll)
+	data, err := cache.WaitUntilCached(ctx, r.cache, cacheKey, r.cacheLockMaxWait, r.cacheLockPoll)
 	if err == nil {
 		return r.unmarshalProduct(data)
 	}

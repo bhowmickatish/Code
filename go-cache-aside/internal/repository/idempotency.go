@@ -84,7 +84,7 @@ func (r *ProductRepository) createWithIdempotencyLock(ctx context.Context, idemK
 		return r.insertProduct(ctx, idemKey, name, priceCents)
 	}
 
-	data, err := cache.WaitForCache(ctx, r.cache, idemKey, r.cacheLockMaxWait, r.cacheLockPoll)
+	data, err := cache.WaitUntilCached(ctx, r.cache, idemKey, r.cacheLockMaxWait, r.cacheLockPoll)
 	if err == nil {
 		return r.productFromIdempotencyData(data)
 	}
