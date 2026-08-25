@@ -23,6 +23,7 @@ type ProductRepository struct {
 	db                *pgxpool.Pool
 	cache             redis.UniversalClient
 	cacheTTL          time.Duration
+	idempotencyTTL    time.Duration
 	cacheLockTTL      time.Duration
 	cacheLockMaxWait  time.Duration
 	cacheLockPoll     time.Duration
@@ -32,12 +33,13 @@ type ProductRepository struct {
 func NewProductRepository(
 	db *pgxpool.Pool,
 	cache redis.UniversalClient,
-	cacheTTL, cacheLockTTL, cacheLockMaxWait, cacheLockPoll time.Duration,
+	cacheTTL, idempotencyTTL, cacheLockTTL, cacheLockMaxWait, cacheLockPoll time.Duration,
 ) *ProductRepository {
 	return &ProductRepository{
 		db:               db,
 		cache:            cache,
 		cacheTTL:         cacheTTL,
+		idempotencyTTL:   idempotencyTTL,
 		cacheLockTTL:     cacheLockTTL,
 		cacheLockMaxWait: cacheLockMaxWait,
 		cacheLockPoll:    cacheLockPoll,
@@ -165,6 +167,16 @@ func (r *ProductRepository) loadAndCache(ctx context.Context, id int64, key stri
 }
 
 func (r *ProductRepository) Create(ctx context.Context, name string, priceCents int64) (*model.Product, error) {
+	idemKey := idempotencyFingerprint(name, priceCents)
+
+	if p, err := r.resolveIdempotency(ctx, idemKey); err != nil || p != nil {
+		return p, err
+	}
+
+	return r.createWithIdempotencyLock(ctx, idemKey, name, priceCents)
+}
+
+func (r *ProductRepository) insertProductRow(ctx context.Context, name string, priceCents int64) (*model.Product, error) {
 	var p model.Product
 	err := r.db.QueryRow(ctx,
 		`INSERT INTO products (name, price_cents) VALUES ($1, $2)

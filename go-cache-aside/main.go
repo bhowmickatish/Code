@@ -45,6 +45,7 @@ func main() {
 		pool,
 		redisClient,
 		cfg.CacheTTL,
+		cfg.IdempotencyTTL,
 		cfg.CacheLockTTL,
 		cfg.CacheLockMaxWait,
 		cfg.CacheLockPollInterval,

@@ -79,7 +79,7 @@ In cache-aside, the application (not the database) manages the cache:
 
 1. **Read:** Check cache → on miss, read from DB → write to cache → return.
 2. **Write:** Update DB → invalidate (delete) the affected cache entry.
-3. **Create:** Write to DB only; cache is populated lazily on first read by ID.
+3. **Create:** Write to DB only; store idempotency record in Redis; cache is populated lazily on first read by ID.
 
 The cache is a **partial, lazy copy** of Postgres. Only products that have been fetched via `GET /products/{id}` may exist in Redis.
 
@@ -128,7 +128,7 @@ Lock/wait failures fail open: load from Postgres without blocking the request.
 
 | Operation | Postgres | Redis |
 |-----------|----------|-------|
-| `Create` | `INSERT` | No cache write |
+| `Create` | `INSERT` (server-assigned `id`) | `SET idempotency:{fingerprint}` — see §3.6 |
 | `Update` | `UPDATE` | `DEL product:{id}` |
 | `Delete` | `DELETE` | `DEL product:{id}` |
 
@@ -141,6 +141,7 @@ Postgres is the source of truth. Redis failures must not fail successful DB oper
 | `GetByID` — cache `SET` after DB read | Logged; product still returned | `200` |
 | `Update` / `Delete` — cache `DEL` after DB write | Logged; DB change stands | `200` / `204` |
 | `GetByID` — cache `GET` error (not `Nil`) | Propagated | `500` |
+| `Create` — idempotency `SET` after DB insert | Logged; product still returned | `201` |
 
 Stale cache entries are bounded by TTL if invalidation fails.
 
@@ -153,6 +154,65 @@ Stale cache entries are bounded by TTL if invalidation fails.
 | Search (`ILIKE`) | Redis has no equivalent indexed query for name substring search |
 | Eviction | TTL or `maxmemory` LRU can remove keys; list must not depend on cache presence |
 | Pagination | `total` count must reflect full dataset or full match set in Postgres |
+
+### 3.6 POST idempotency (Create)
+
+`POST /products` is idempotent without any client header. The application handles deduplication internally.
+
+#### Assumptions
+
+| Input | Role |
+|-------|------|
+| `name` + `price_cents` | Logical create identity — idempotency fingerprint input |
+| `id` | **Server-generated** (`BIGSERIAL`) on first insert; returned in `201`; not known to the client before create |
+
+Because `id` does not exist until after the first successful insert, it cannot be the idempotency **key** for retries. The key is derived from the request body instead.
+
+#### Fingerprint and Redis record
+
+```
+fingerprint = SHA-256(name + "\x00" + price_cents)
+Redis key   = idempotency:{hex(fingerprint)}
+Redis value = JSON { name, price_cents, product }   // product includes server-assigned id
+TTL         = IDEMPOTENCY_TTL (default 24h)
+```
+
+Implementation: `internal/repository/idempotency.go` (`idempotencyFingerprint`).
+
+#### Request flow
+
+```
+POST /products  {"name", "price_cents"}
+        │
+        ▼
+   Redis GET idempotency:{fingerprint}
+        │
+   ┌────┴────┐
+   │ hit     │ miss
+   ▼         ▼
+ return    Redis lock on idempotency:{fingerprint}
+ stored       │
+ product      ├─ lock acquired → Postgres INSERT → SET idempotency record → 201
+ (201)        └─ lock not acquired → poll Redis until record appears (or fallback insert)
+```
+
+Concurrent identical POSTs across instances use the same **Redis lock + poll** pattern as cache stampede mitigation (§3.2), so only one Postgres `INSERT` runs per fingerprint.
+
+#### Client contract
+
+- **No `Idempotency-Key` header** — client API unchanged.
+- **Retry safety:** repeat the same JSON body → same `201` response with the same server-assigned `id`.
+- **Different body:** different `name` or `price_cents` → different fingerprint → new product.
+
+#### Trade-offs
+
+| Benefit | Cost |
+|---------|------|
+| Safe retries on network timeout / client replay | Two **intentional** creates with identical `name` + `price_cents` within `IDEMPOTENCY_TTL` return the **same** product |
+| Works with server-generated IDs | After TTL expires, an identical body creates a **new** row (new `id`) |
+| No client idempotency plumbing | Natural-key dedup — not suitable if duplicate name/price products are valid business entities |
+
+`PUT` remains idempotent by HTTP semantics (same resource state on repeat). `POST` idempotency here is **application-level dedup** keyed on create inputs, not on product `id`.
 
 ---
 
@@ -211,7 +271,7 @@ Base URL: `http://localhost:8080` (configurable via `SERVER_ADDR`).
 |--------|------|-------------|----------------|
 | `GET` | `/products` | Postgres | None |
 | `GET` | `/products?q={term}` | Postgres (`ILIKE` on name) | None |
-| `POST` | `/products` | Postgres | None |
+| `POST` | `/products` | Postgres | `SET idempotency:{fingerprint}` (§3.6) |
 | `GET` | `/products/{id}` | Cache-aside | Read-through on miss |
 | `PUT` | `/products/{id}` | Postgres | Invalidate key |
 | `DELETE` | `/products/{id}` | Postgres | Invalidate key |
@@ -252,6 +312,8 @@ Response wrapper (`ProductPage`):
 ### 5.3 Request / response examples
 
 **Create**
+
+See §3.6 for full idempotency design. Summary: identical `name` + `price_cents` within `IDEMPOTENCY_TTL` replays the same server-generated product; no client header required.
 
 ```http
 POST /products
@@ -452,6 +514,7 @@ TTL expiration and LRU eviction are complementary: TTL controls time-based fresh
 | `CACHE_LOCK_TTL` | `10s` | Redis lock auto-expire if loader crashes |
 | `CACHE_LOCK_MAX_WAIT` | `3s` | Max time lock waiters poll cache before fallback load |
 | `CACHE_LOCK_POLL_INTERVAL` | `50ms` | Poll interval while waiting for cache populate |
+| `IDEMPOTENCY_TTL` | `24h` | Redis deduplication window for identical POST `name` + `price_cents` (§3.6) |
 | `PAGE_DEFAULT_LIMIT` | `20` | Default page size for list/search |
 | `PAGE_DEFAULT_OFFSET` | `0` | Default offset for list/search |
 | `PAGE_MAX_LIMIT` | `100` | Maximum allowed `limit` query param |
@@ -499,7 +562,7 @@ go run .
 
 ### 11.2 Create then list vs get
 
-1. `POST /products` — Postgres INSERT → `201`. Redis unchanged.
+1. `POST /products` — see §3.6: fingerprint `name` + `price_cents` → Redis idempotency check → Postgres INSERT on first use → `201`. Product read cache unchanged.
 2. `GET /products` — Postgres SELECT (paginated) → product appears in list.
 3. `GET /products/1` — Redis miss → Postgres → cache populate.
 
@@ -599,6 +662,7 @@ Repository code is unchanged — keys only (`product:{id}`); routing is internal
 | Invalidate on write, not write-through | Simpler; next read repopulates cache |
 | JSON in Redis | Human-readable, matches API response shape |
 | No cache on create | Lazy population avoids caching entities never read |
+| POST idempotency via body fingerprint | Server-generated `id`; dedup keyed on `name` + `price_cents` in Redis (§3.6) — no client header |
 | `ILIKE` search in Postgres | Simple substring search for demo API |
 | Search indexes outside app | DDL/index lifecycle is infrastructure, not application code |
 | Integer `price_cents` | Exact money storage; no float drift in DB, cache, or API |
@@ -612,6 +676,7 @@ Repository code is unchanged — keys only (`product:{id}`); routing is internal
 - Search can be expensive at scale without external `pg_trgm` index.
 - Pagination does not reduce search scan cost without database indexes.
 - Lock wait timeout can cause a rare duplicate Postgres read (fail-open fallback).
+- POST idempotency treats identical `name` + `price_cents` as one logical create within `IDEMPOTENCY_TTL` (§3.6).
 - No structured metrics/tracing (cache/Redis failures are log-only).
 - `OFFSET` pagination degrades for very large offsets (keyset pagination not implemented).
 - Invalid `PAGE_*` env vars fail at startup; other misconfig may still go unnoticed.

@@ -16,6 +16,7 @@ type Config struct {
 	PostgresURL           string
 	RedisClusterAddrs     []string
 	CacheTTL              time.Duration
+	IdempotencyTTL        time.Duration
 	CacheLockTTL          time.Duration
 	CacheLockMaxWait      time.Duration
 	CacheLockPollInterval time.Duration
@@ -51,6 +52,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	idempotencyTTL, err := envDuration("IDEMPOTENCY_TTL", 24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
 
 	appEnv := envOrDefault("APP_ENV", DefaultAppEnv)
 
@@ -60,6 +65,7 @@ func Load() (Config, error) {
 		PostgresURL:           envOrDefault("POSTGRES_URL", "postgres://app:app@localhost:5432/appdb?sslmode=disable"),
 		RedisClusterAddrs:     envCSV("REDIS_CLUSTER_ADDRS", "localhost:6379,localhost:6380,localhost:6381"),
 		CacheTTL:              5 * time.Minute,
+		IdempotencyTTL:        idempotencyTTL,
 		CacheLockTTL:          cacheLockTTL,
 		CacheLockMaxWait:      cacheLockMaxWait,
 		CacheLockPollInterval: cacheLockPollInterval,
