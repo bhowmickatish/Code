@@ -583,7 +583,7 @@ TTL expiration and LRU eviction are complementary: TTL controls time-based fresh
 | -------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | `APP_ENV`                  | `development`                                             | Drives `IsDevelopmentMode`; when `development`, runs `db.Migrate()` on startup |
 | `POSTGRES_URL`             | `postgres://app:app@localhost:5432/appdb?sslmode=disable` | Postgres connection string                                                     |
-| `REDIS_CLUSTER_ADDRS`      | `localhost:6379,localhost:6380,localhost:6381`            | Comma-separated Redis Cluster node addresses                                   |
+| `REDIS_CLUSTER_ADDRS`      | `localhost:6379,localhost:6380,localhost:6381`            | Comma-separated cluster master addresses (client bootstraps full topology)     |
 | `SERVER_ADDR`              | `:8080`                                                   | HTTP listen address                                                            |
 | `CacheTTL`                 | `5m` (code default)                                       | Redis key TTL on cache populate                                                |
 | `CACHE_LOCK_TTL`           | `10s`                                                     | Redis lock auto-expire if loader crashes                                       |
@@ -611,11 +611,11 @@ Pagination defaults are loaded in config and passed into `ProductHandler`. Query
 | Service       | Image                        | Ports            |
 | ------------- | ---------------------------- | ---------------- |
 | Postgres 16   | `postgres:16-alpine`         | 5432             |
-| Redis Cluster | `redis:7-alpine` × 3 masters | 6379, 6380, 6381 |
+| Redis Cluster | `redis:7-alpine` × 3 masters + 3 replicas | 6379–6384 |
 | Go app        | local build (Go 1.26+)       | 8080             |
 
 
-Local Docker Compose runs a **3-master Redis Cluster** (no replicas). Nodes use `cluster-announce-ip` / `cluster-announce-port` so the app on the host can route via slot-aware client. A one-shot `redis-cluster-init` container forms the cluster on first start.
+Local Docker Compose runs a **3-master Redis Cluster with 1 replica per master** (6 nodes). Nodes use `cluster-announce-ip` / `cluster-announce-port` so the app on the host can route via slot-aware client. A one-shot `redis-cluster-init` container forms the cluster on first start (`--cluster-replicas 1`).
 
 The application uses `redis.NewClusterClient` (`go-redis`). The client computes key slots and routes `GET` / `SET` / `DEL` to the correct node; repository code only passes key names (e.g. `product:42`).
 

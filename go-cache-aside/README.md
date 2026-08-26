@@ -32,7 +32,29 @@ DELETE /products/{id}
   → Postgres DELETE → invalidate Redis `product:{id}`
 ```
 
-Redis nodes in `docker-compose.yml` use `maxmemory 256mb` and `volatile-lru` for capacity eviction (keys with TTL only).
+Redis in `docker-compose.yml` runs a **3-master cluster with one replica per master** (6 containers). Masters are on host ports **6379–6381**; replicas on **6382–6384**. All nodes use AOF persistence, `maxmemory 256mb`, and `volatile-lru` eviction (TTL keys only). The app connects via the three **master** addresses; `go-redis` discovers replicas and handles failover topology automatically.
+
+| Host port | Role    |
+| --------- | ------- |
+| 6379      | master  |
+| 6380      | master  |
+| 6381      | master  |
+| 6382      | replica |
+| 6383      | replica |
+| 6384      | replica |
+
+If you previously ran the old 3-node (no-replica) stack, reset volumes before re-forming the cluster:
+
+```bash
+docker compose down -v
+docker compose up -d
+```
+
+Verify topology:
+
+```bash
+redis-cli -p 6379 cluster nodes
+```
 
 ### POST idempotency (summary)
 
@@ -57,7 +79,7 @@ Full detail: [DESIGN.md §3.6](./DESIGN.md#36-post-idempotency-create).
 ## Quick Start
 
 ```bash
-# Start Postgres and Redis Cluster (3 masters on 6379, 6380, 6381)
+# Start Postgres and Redis Cluster (see port table above)
 docker compose up -d
 
 # Run the app (APP_ENV=development by default — runs schema migrate)
@@ -103,7 +125,7 @@ curl -X DELETE http://localhost:8080/products/1
 | -------------------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | `APP_ENV`                  | `development`                                             | When `development`, runs `db.Migrate()` on startup; use `production` to skip |
 | `POSTGRES_URL`             | `postgres://app:app@localhost:5432/appdb?sslmode=disable` | Postgres connection string                                                   |
-| `REDIS_CLUSTER_ADDRS`      | `localhost:6379,localhost:6380,localhost:6381`            | Comma-separated cluster node addresses                                       |
+| `REDIS_CLUSTER_ADDRS`      | `localhost:6379,localhost:6380,localhost:6381`            | Comma-separated cluster master addresses (client bootstraps full topology)   |
 | `SERVER_ADDR`              | `:8080`                                                   | HTTP listen address                                                          |
 | `PAGE_DEFAULT_LIMIT`       | `20`                                                      | Default page size for list/search                                            |
 | `PAGE_DEFAULT_OFFSET`      | `0`                                                       | Default offset for list/search                                               |
