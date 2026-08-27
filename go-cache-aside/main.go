@@ -48,7 +48,6 @@ func main() {
 		cfg.IdempotencyTTL,
 		cfg.CacheLockTTL,
 		cfg.CacheLockMaxWait,
-		cfg.CacheLockPollInterval,
 	)
 	productHandler := handler.NewProductHandler(repo, cfg.PageDefaultLimit, cfg.PageDefaultOffset, cfg.PageMaxLimit)
 

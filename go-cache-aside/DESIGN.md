@@ -68,7 +68,7 @@ The design optimizes **repeat reads of the same product** while keeping list and
 | Config     | `internal/config`     | Environment-backed settings (URLs, TTL, pagination defaults)       |
 | Model      | `internal/model`      | Domain structs (`Product`, `ProductPage`)                          |
 | DB         | `internal/db`         | Postgres connection pool; dev-only schema migration                |
-| Cache      | `internal/cache`      | Redis Cluster client (`NewClusterClient`)                          |
+| Cache      | `internal/cache`      | Redis Cluster client, slot keys, locks, `SetCached` (Lua), `WaitUntilCached` (BRPOP) |
 | Repository | `internal/repository` | Data access + cache-aside orchestration (bridge layer)             |
 | Handler    | `internal/handler`    | REST API surface                                                   |
 
@@ -77,7 +77,7 @@ The **repository** is the bridge between REST handlers and storage. Handlers nev
 
 - When to read Redis vs Postgres.
 - SQL for list, search, and CRUD.
-- Cache key format, TTL on populate, and invalidation on write/delete.
+- Cache key format (hash-tagged slot keys), atomic populate + notify, TTL on populate, and invalidation on write/delete.
 
 ---
 
@@ -102,13 +102,13 @@ The cache is a **partial, lazy copy** of Postgres. Only products that have been 
 Cache misses use a two-gate stampede mitigation path before hitting Postgres:
 
 1. **Gate 1 —** `singleflight` **(per process):** one in-flight load per product ID per instance.
-2. **Gate 2 — Redis lock (cross-instance):** `SET lock:product:{id} NX EX`; one loader globally; waiters poll cache.
+2. **Gate 2 — Redis lock (cross-instance):** `SET {product:{id}}:lock NX EX`; one loader globally; waiters block on `BRPOP {product:{id}}:notify`.
 
 ```
 GET /products/{id}
         │
         ▼
-   Redis GET product:{id}
+   Redis GET {product:{id}}:data
         │
    ┌────┴────┐
    │ hit     │ miss (or corrupt JSON)
@@ -116,21 +116,21 @@ GET /products/{id}
  return    Gate 1: singleflight.Do (per instance)
             │
             ▼
-       Gate 2: SET lock:product:{id} NX
+       Gate 2: SET {product:{id}}:lock NX
             │
      ┌──────┴──────┐
      │ acquired    │ not acquired
      ▼             ▼
-  double-check   poll GET product:{id}
-  cache          until populated or timeout
+  double-check   BRPOP {product:{id}}:notify
+  GET :data      (or timeout) → GET :data
      │             │
      ▼             ▼
   Postgres       return cached (or fallback load)
   SELECT
      │
      ▼
-  Redis SET product:{id} (TTL = 5 min)
-  DEL lock:product:{id}
+  Lua: SET {product:{id}}:data + LPUSH {product:{id}}:notify (TTL 5 min)
+  Release {product:{id}}:lock (compare-and-del)
      │
      ▼
   return
@@ -138,14 +138,16 @@ GET /products/{id}
 
 Lock/wait failures fail open: load from Postgres without blocking the request.
 
+Slot keys `{product:{id}}` use a Redis Cluster **hash tag** so `:data`, `:notify`, and `:lock` share one slot (required for atomic Lua `SET` + `LPUSH`).
+
 ### 3.3 Write paths
 
 
-| Operation | Postgres                        | Redis                                      |
-| --------- | ------------------------------- | ------------------------------------------ |
-| `Create`  | `INSERT` (server-assigned `id`) | `SET idempotency:{fingerprint}` — see §3.6 |
-| `Update`  | `UPDATE`                        | `DEL product:{id}`                         |
-| `Delete`  | `DELETE`                        | `DEL product:{id}`                         |
+| Operation | Postgres                        | Redis                                                                 |
+| --------- | ------------------------------- | --------------------------------------------------------------------- |
+| `Create`  | `INSERT` (server-assigned `id`) | `SetCached` on `{idempotency:{hash}}:data` + notify — see §3.6       |
+| `Update`  | `UPDATE`                        | `DEL {product:{id}}:data` and `{product:{id}}:notify`                 |
+| `Delete`  | `DELETE`                        | `DEL {product:{id}}:data` and `{product:{id}}:notify`                 |
 
 
 
@@ -157,8 +159,8 @@ Postgres is the source of truth. Redis failures must not fail successful DB oper
 
 | Operation                                        | Redis failure                  | HTTP result   |
 | ------------------------------------------------ | ------------------------------ | ------------- |
-| `GetByID` — cache `SET` after DB read            | Logged; product still returned | `200`         |
-| `Update` / `Delete` — cache `DEL` after DB write | Logged; DB change stands       | `200` / `204` |
+| `GetByID` — cache populate after DB read         | Logged; product still returned | `200`         |
+| `Update` / `Delete` — cache invalidate after DB  | Logged; DB change stands       | `200` / `204` |
 | `GetByID` — cache `GET` error (not `Nil`)        | Propagated                     | `500`         |
 | `Create` — idempotency `SET` after DB insert     | Logged; product still returned | `201`         |
 
@@ -198,12 +200,13 @@ Because `id` does not exist until after the first successful insert, it cannot b
 
 ```
 fingerprint = SHA-256(name + "\x00" + price_cents)
-Redis key   = idempotency:{hex(fingerprint)}
+hash        = hex(fingerprint)
+Redis keys  = {idempotency:{hash}}:data | :notify | :lock   (same hash slot)
 Redis value = JSON { name, price_cents, product }   // product includes server-assigned id
 TTL         = IDEMPOTENCY_TTL (default 24h)
 ```
 
-Implementation: `internal/repository/idempotency.go` (`idempotencyFingerprint`).
+Populate uses the same atomic `SetCached` Lua script as product cache (`SET :data` + `LPUSH :notify`). Implementation: `internal/repository/idempotency.go` (`idempotencyHash`, `cache.IdempotencySlotKeys`).
 
 #### Request flow
 
@@ -211,18 +214,18 @@ Implementation: `internal/repository/idempotency.go` (`idempotencyFingerprint`).
 POST /products  {"name", "price_cents"}
         │
         ▼
-   Redis GET idempotency:{fingerprint}
+   Redis GET {idempotency:{hash}}:data
         │
    ┌────┴────┐
    │ hit     │ miss
    ▼         ▼
- return    Redis lock on idempotency:{fingerprint}
+ return    SET {idempotency:{hash}}:lock NX
  stored       │
- product      ├─ lock acquired → Postgres INSERT → SET idempotency record → 201
- (201)        └─ lock not acquired → poll Redis until record appears (or fallback insert)
+ product      ├─ lock acquired → Postgres INSERT → SetCached → 201
+ (201)        └─ lock not acquired → BRPOP :notify (or fallback insert)
 ```
 
-Concurrent identical POSTs across instances use the same **Redis lock + poll** pattern as cache stampede mitigation (§3.2), so only one Postgres `INSERT` runs per fingerprint.
+Concurrent identical POSTs across instances use the same **Redis lock + BRPOP notify** pattern as cache stampede mitigation (§3.2), so only one Postgres `INSERT` runs per fingerprint.
 
 #### Client contract
 
@@ -291,13 +294,23 @@ CREATE TABLE products (
 
 ### 4.3 Redis key format
 
+Each logical entry uses three **hash-tagged** keys on the same cluster slot (`{tag}` in the key determines the slot):
 
-| Key            | Value                     | TTL                    |
-| -------------- | ------------------------- | ---------------------- |
-| `product:{id}` | JSON-serialized `Product` | 5 minutes (`CacheTTL`) |
+| Tag / entry | `:data` (value) | `:notify` (list) | `:lock` (SET NX) |
+| ----------- | --------------- | ---------------- | ---------------- |
+| `{product:42}` | JSON `Product`, TTL 5m | `LPUSH` / `BRPOP` signal | token lock |
+| `{idempotency:{hash}}` | JSON idempotency record, TTL 24h | same | same |
 
+Examples:
 
-Example: `product:42` → `{"id":42,"name":"Widget","price_cents":999,"created_at":"..."}`
+- `{product:42}:data` → `{"id":42,"name":"Widget","price_cents":999,"created_at":"..."}`
+- `{idempotency:a3f5b2…}:data` → `{"name":"Widget","price_cents":999,"product":{...}}`
+
+**Populate (holder):** Lua script atomically `SET :data` + `LPUSH :notify` (`internal/cache/scripts/set_cache.lua`).
+
+**Wait (loser):** `BRPOP :notify` with `CACHE_LOCK_MAX_WAIT`, then `GET :data`.
+
+**Invalidate:** `DEL :data` and `:notify` on product update/delete.
 
 ---
 
@@ -314,10 +327,10 @@ Base URL: `http://localhost:8080` (configurable via `SERVER_ADDR`).
 | -------- | -------------------- | -------------------------- | -------------------------------------- |
 | `GET`    | `/products`          | Postgres                   | None                                   |
 | `GET`    | `/products?q={term}` | Postgres (`ILIKE` on name) | None                                   |
-| `POST`   | `/products`          | Postgres                   | `SET idempotency:{fingerprint}` (§3.6) |
+| `POST`   | `/products`          | Postgres                   | `SetCached` on idempotency slot (§3.6) |
 | `GET`    | `/products/{id}`     | Cache-aside                | Read-through on miss                   |
-| `PUT`    | `/products/{id}`     | Postgres                   | Invalidate key                         |
-| `DELETE` | `/products/{id}`     | Postgres                   | Invalidate key                         |
+| `PUT`    | `/products/{id}`     | Postgres                   | Invalidate `:data` + `:notify`         |
+| `DELETE` | `/products/{id}`     | Postgres                   | Invalidate `:data` + `:notify`         |
 
 
 List and search share `GET /products`. When `q` is present and non-empty, the handler routes to `Search`; otherwise `List`.
@@ -558,7 +571,7 @@ Two independent mechanisms affect Redis entries:
 
 ### 8.1 Per-key TTL (application)
 
-- Set via `cache.Set(key, data, CacheTTL)` on cache miss in `GetByID`.
+- Set via `cache.SetCached` (Lua `SET :data` + `LPUSH :notify`) on cache miss in `GetByID` and idempotency store.
 - Default: **5 minutes** (`internal/config/config.go`).
 - Purpose: bound staleness if a write path fails to invalidate (defense in depth).
 
@@ -566,7 +579,7 @@ Two independent mechanisms affect Redis entries:
 
 ### 8.2 Redis memory eviction (server, optional)
 
-- Not configured in default `docker-compose.yml`.
+- Configured in `docker-compose.yml`: `maxmemory 256mb`, `maxmemory-policy volatile-lru` on each Redis node.
 - To enable LRU under memory pressure, set Redis `maxmemory` and `maxmemory-policy` (e.g. `volatile-lru` for keys with TTL).
 - Evicted keys cause a cache miss on the next `GET /products/{id}`; Postgres repopulates the cache.
 
@@ -587,8 +600,7 @@ TTL expiration and LRU eviction are complementary: TTL controls time-based fresh
 | `SERVER_ADDR`              | `:8080`                                                   | HTTP listen address                                                            |
 | `CacheTTL`                 | `5m` (code default)                                       | Redis key TTL on cache populate                                                |
 | `CACHE_LOCK_TTL`           | `10s`                                                     | Redis lock auto-expire if loader crashes                                       |
-| `CACHE_LOCK_MAX_WAIT`      | `3s`                                                      | Max time lock waiters poll cache before fallback load                          |
-| `CACHE_LOCK_POLL_INTERVAL` | `50ms`                                                    | Poll interval while waiting for cache populate                                 |
+| `CACHE_LOCK_MAX_WAIT`      | `3s`                                                      | Max time lock waiters block on `BRPOP :notify` before fallback load            |
 | `IDEMPOTENCY_TTL`          | `24h`                                                     | Redis deduplication window for identical POST `name` + `price_cents` (§3.6)    |
 | `PAGE_DEFAULT_LIMIT`       | `20`                                                      | Default page size for list/search                                              |
 | `PAGE_DEFAULT_OFFSET`      | `0`                                                       | Default offset for list/search                                                 |
@@ -617,7 +629,7 @@ Pagination defaults are loaded in config and passed into `ProductHandler`. Query
 
 Local Docker Compose runs a **3-master Redis Cluster with 1 replica per master** (6 nodes). Nodes use `cluster-announce-ip` / `cluster-announce-port` so the app on the host can route via slot-aware client. A one-shot `redis-cluster-init` container forms the cluster on first start (`--cluster-replicas 1`).
 
-The application uses `redis.NewClusterClient` (`go-redis`). The client computes key slots and routes `GET` / `SET` / `DEL` to the correct node; repository code only passes key names (e.g. `product:42`).
+The application uses `redis.NewClusterClient` (`go-redis`). The client computes key slots and routes commands to the correct node; repository code passes slot key names (e.g. `{product:42}:data`).
 
 Start dependencies:
 
@@ -647,7 +659,7 @@ go run .
 
 ### 11.1 Repeated read by ID
 
-1. `GET /products/1` — Redis miss → Postgres → Redis SET (TTL 5m) → `200`.
+1. `GET /products/1` — Redis miss → Postgres → `SetCached` on `{product:1}:data` → `200`.
 2. `GET /products/1` — Redis hit → `200` (no Postgres query).
 
 
@@ -663,7 +675,7 @@ go run .
 ### 11.3 Update invalidates cache
 
 1. `GET /products/1` — cached in Redis.
-2. `PUT /products/1` — Postgres UPDATE → Redis DEL `product:1`.
+2. `PUT /products/1` — Postgres UPDATE → `DEL {product:1}:data` + `:notify`.
 3. `GET /products/1` — Redis miss → fresh read from Postgres → re-cache.
 
 
@@ -716,8 +728,8 @@ Each instance is independent: own HTTP server, Postgres connection pool, and `Cl
 
 | Scenario                             | Cross-instance behavior                                        |
 | ------------------------------------ | -------------------------------------------------------------- |
-| Instance A caches `product:1`        | Instance B `GET /products/1` → Redis hit                       |
-| Instance B `PUT /products/1` → `DEL` | Instance A next read → miss → Postgres → re-cache              |
+| Instance A caches `{product:1}:data` | Instance B `GET /products/1` → Redis hit                      |
+| Instance B `PUT /products/1`         | Instance A next read → miss → Postgres → re-cache             |
 | Instance C `POST /products`          | Visible in list/search on all instances immediately (Postgres) |
 
 
@@ -741,7 +753,7 @@ Each instance may use its own `SERVER_ADDR` (e.g. `:8080` per container/pod).
 
 Each process creates one `ClusterClient` via `cache.NewClusterClient`. Each client maintains its own slot→node topology map in memory. That is expected: topology is fetched from the cluster, not shared across processes.
 
-Repository code is unchanged — keys only (`product:{id}`); routing is internal to each client.
+Repository code passes slot key strings (e.g. `{product:42}:data`); hash tags keep related keys on one shard; routing is internal to each `ClusterClient`.
 
 ### 12.5 Operational considerations
 
@@ -750,7 +762,7 @@ Repository code is unchanged — keys only (`product:{id}`); routing is internal
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | Startup migrations | `db.Migrate()` runs only when `IsDevelopmentMode` (`APP_ENV=development`). Production uses external migration tooling and `APP_ENV=production`. |
 | Connection limits  | N instances × pool size = total Postgres and Redis connections — size pools accordingly.                                                        |
-| Cache stampede     | Mitigated via `singleflight` (per instance) + Redis lock on miss (cross-instance); see §3.2.                                                    |
+| Cache stampede     | Mitigated via `singleflight` (per instance) + Redis lock + `BRPOP` notify on miss (§3.2). |
 | Load balancer      | Any HTTP LB (round-robin, least-conn) works; no session affinity needed.                                                                        |
 
 

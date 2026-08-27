@@ -17,8 +17,6 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-const productKeyPrefix = "product:"
-
 type ProductRepository struct {
 	db               *pgxpool.Pool
 	cache            redis.UniversalClient
@@ -26,14 +24,13 @@ type ProductRepository struct {
 	idempotencyTTL   time.Duration
 	cacheLockTTL     time.Duration
 	cacheLockMaxWait time.Duration
-	cacheLockPoll    time.Duration
 	loadGroup        singleflight.Group
 }
 
 func NewProductRepository(
 	db *pgxpool.Pool,
 	cache redis.UniversalClient,
-	cacheTTL, idempotencyTTL, cacheLockTTL, cacheLockMaxWait, cacheLockPoll time.Duration,
+	cacheTTL, idempotencyTTL, cacheLockTTL, cacheLockMaxWait time.Duration,
 ) *ProductRepository {
 	return &ProductRepository{
 		db:               db,
@@ -42,14 +39,13 @@ func NewProductRepository(
 		idempotencyTTL:   idempotencyTTL,
 		cacheLockTTL:     cacheLockTTL,
 		cacheLockMaxWait: cacheLockMaxWait,
-		cacheLockPoll:    cacheLockPoll,
 	}
 }
 
 func (r *ProductRepository) GetByID(ctx context.Context, id int64) (*model.Product, error) {
-	key := productKey(id)
+	keys := cache.ProductSlotKeys(id)
 
-	p, ok, err := r.getFromCache(ctx, key)
+	p, ok, err := r.getFromCache(ctx, keys)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +57,7 @@ func (r *ProductRepository) GetByID(ctx context.Context, id int64) (*model.Produ
 	ch := r.loadGroup.DoChan(flightKey, func() (any, error) {
 		loadCtx, cancel := context.WithTimeout(context.Background(), r.cacheLockMaxWait+r.cacheLockTTL)
 		defer cancel()
-		return r.loadThroughGates(loadCtx, id, key)
+		return r.loadThroughGates(loadCtx, id, keys)
 	})
 
 	select {
@@ -79,55 +75,54 @@ func (r *ProductRepository) GetByID(ctx context.Context, id int64) (*model.Produ
 	}
 }
 
-func (r *ProductRepository) loadThroughGates(ctx context.Context, id int64, cacheKey string) (*model.Product, error) {
-	if p, ok, err := r.getFromCache(ctx, cacheKey); err != nil {
+func (r *ProductRepository) loadThroughGates(ctx context.Context, id int64, keys cache.SlotKeys) (*model.Product, error) {
+	if p, ok, err := r.getFromCache(ctx, keys); err != nil {
 		return nil, err
 	} else if ok {
 		return p, nil
 	}
 
-	lockKey := cache.LockKey(cacheKey)
-	lock, acquired, err := cache.TryAcquireLock(ctx, r.cache, lockKey, r.cacheLockTTL)
+	lock, acquired, err := cache.TryAcquireLock(ctx, r.cache, keys.Lock, r.cacheLockTTL)
 	if err != nil {
-		log.Printf("cache lock acquire %s: %v", lockKey, err)
-		return r.loadAndCache(ctx, id, cacheKey)
+		log.Printf("cache lock acquire %s: %v", keys.Lock, err)
+		return r.loadAndCache(ctx, id, keys)
 	}
 
 	if acquired {
 		defer func() {
 			if err := lock.Release(ctx); err != nil {
-				log.Printf("cache lock release %s: %v", lockKey, err)
+				log.Printf("cache lock release %s: %v", keys.Lock, err)
 			}
 		}()
 
-		if p, ok, err := r.getFromCache(ctx, cacheKey); err != nil {
+		if p, ok, err := r.getFromCache(ctx, keys); err != nil {
 			return nil, err
 		} else if ok {
 			return p, nil
 		}
 
-		return r.loadAndCache(ctx, id, cacheKey)
+		return r.loadAndCache(ctx, id, keys)
 	}
 
-	data, err := cache.WaitUntilCached(ctx, r.cache, cacheKey, r.cacheLockMaxWait, r.cacheLockPoll)
+	data, err := cache.WaitUntilCached(ctx, r.cache, keys, r.cacheLockMaxWait)
 	if err == nil {
 		return r.unmarshalProduct(data)
 	}
 	if !errors.Is(err, cache.ErrWaitTimeout) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-		log.Printf("cache wait %s: %v", cacheKey, err)
+		log.Printf("cache wait %s: %v", keys.Data, err)
 	}
 
-	if p, ok, err := r.getFromCache(ctx, cacheKey); err != nil {
+	if p, ok, err := r.getFromCache(ctx, keys); err != nil {
 		return nil, err
 	} else if ok {
 		return p, nil
 	}
 
-	return r.loadAndCache(ctx, id, cacheKey)
+	return r.loadAndCache(ctx, id, keys)
 }
 
-func (r *ProductRepository) getFromCache(ctx context.Context, key string) (*model.Product, bool, error) {
-	cached, err := r.cache.Get(ctx, key).Bytes()
+func (r *ProductRepository) getFromCache(ctx context.Context, keys cache.SlotKeys) (*model.Product, bool, error) {
+	cached, err := r.cache.Get(ctx, keys.Data).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return nil, false, nil
 	}
@@ -149,7 +144,7 @@ func (r *ProductRepository) unmarshalProduct(data []byte) (*model.Product, error
 	return &p, nil
 }
 
-func (r *ProductRepository) loadAndCache(ctx context.Context, id int64, key string) (*model.Product, error) {
+func (r *ProductRepository) loadAndCache(ctx context.Context, id int64, keys cache.SlotKeys) (*model.Product, error) {
 	p, err := r.getFromDB(ctx, id)
 	if err != nil {
 		return nil, err
@@ -159,21 +154,21 @@ func (r *ProductRepository) loadAndCache(ctx context.Context, id int64, key stri
 	if err != nil {
 		return p, nil
 	}
-	if err := r.cache.Set(ctx, key, data, r.cacheTTL).Err(); err != nil {
-		log.Printf("cache set %s: %v", key, err)
+	if err := cache.SetCached(ctx, r.cache, keys, data, r.cacheTTL); err != nil {
+		log.Printf("cache set %s: %v", keys.Data, err)
 	}
 
 	return p, nil
 }
 
 func (r *ProductRepository) Create(ctx context.Context, name string, priceCents int64) (*model.Product, error) {
-	idemKey := idempotencyFingerprint(name, priceCents)
+	keys := cache.IdempotencySlotKeys(idempotencyHash(name, priceCents))
 
-	if p, err := r.resolveIdempotency(ctx, idemKey); err != nil || p != nil {
+	if p, err := r.resolveIdempotency(ctx, keys); err != nil || p != nil {
 		return p, err
 	}
 
-	return r.createWithIdempotencyLock(ctx, idemKey, name, priceCents)
+	return r.createWithIdempotencyLock(ctx, keys, name, priceCents)
 }
 
 func (r *ProductRepository) insertProductRow(ctx context.Context, name string, priceCents int64) (*model.Product, error) {
@@ -203,8 +198,9 @@ func (r *ProductRepository) Update(ctx context.Context, id int64, name string, p
 		return nil, fmt.Errorf("update product: %w", err)
 	}
 
-	if err := r.cache.Del(ctx, productKey(id)).Err(); err != nil {
-		log.Printf("cache invalidate %s: %v", productKey(id), err)
+	keys := cache.ProductSlotKeys(id)
+	if err := cache.DeleteSlot(ctx, r.cache, keys); err != nil {
+		log.Printf("cache invalidate %s: %v", keys.Data, err)
 	}
 
 	return &p, nil
@@ -219,8 +215,9 @@ func (r *ProductRepository) Delete(ctx context.Context, id int64) error {
 		return ErrNotFound
 	}
 
-	if err := r.cache.Del(ctx, productKey(id)).Err(); err != nil {
-		log.Printf("cache invalidate %s: %v", productKey(id), err)
+	keys := cache.ProductSlotKeys(id)
+	if err := cache.DeleteSlot(ctx, r.cache, keys); err != nil {
+		log.Printf("cache invalidate %s: %v", keys.Data, err)
 	}
 	return nil
 }
@@ -302,8 +299,4 @@ func (r *ProductRepository) getFromDB(ctx context.Context, id int64) (*model.Pro
 		return nil, fmt.Errorf("query product: %w", err)
 	}
 	return &p, nil
-}
-
-func productKey(id int64) string {
-	return fmt.Sprintf("%s%d", productKeyPrefix, id)
 }

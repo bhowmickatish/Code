@@ -8,13 +8,13 @@ See [DESIGN.md](./DESIGN.md) for full architecture and design decisions.
 
 ```
 GET /products/{id}
-  1. Check Redis for key `product:{id}`
+  1. Check Redis for key `{product:id}:data`
   2. On hit  → return cached JSON
   3. On miss → two-gate stampede mitigation, then load and cache:
        Gate 1 (singleflight): one in-flight load per product ID per instance
-       Gate 2 (Redis lock):   SET lock:product:{id} NX — one loader globally;
-                              waiters poll cache until populated (see DESIGN.md §3.2)
-     → read from PostgreSQL, write to Redis (TTL 5 min), return
+       Gate 2 (Redis lock):   SET `{product:id}:lock` NX — one loader globally;
+                              waiters BRPOP `{product:id}:notify` until populated (see DESIGN.md §3.2)
+     → read from PostgreSQL, atomic SET data + LPUSH notify (Lua), return
 
 GET /products / GET /products?q=...
   → Always PostgreSQL (paginated; never cached)
@@ -26,10 +26,10 @@ POST /products
   → Product `id` is server-generated (BIGSERIAL); not used as idempotency key (see DESIGN.md §3.6)
 
 PUT /products/{id}
-  → Postgres UPDATE → invalidate Redis `product:{id}` (HTTP-idempotent)
+  → Postgres UPDATE → invalidate Redis `{product:id}:data` (+ notify list)
 
 DELETE /products/{id}
-  → Postgres DELETE → invalidate Redis `product:{id}`
+  → Postgres DELETE → invalidate Redis `{product:id}:data` (+ notify list)
 ```
 
 Redis in `docker-compose.yml` runs a **3-master cluster with one replica per master** (6 containers). Masters are on host ports **6379–6381**; replicas on **6382–6384**. All nodes use AOF persistence, `maxmemory 256mb`, and `volatile-lru` eviction (TTL keys only). The app connects via the three **master** addresses; `go-redis` discovers replicas and handles failover topology automatically.
@@ -131,8 +131,7 @@ curl -X DELETE http://localhost:8080/products/1
 | `PAGE_DEFAULT_OFFSET`      | `0`                                                       | Default offset for list/search                                               |
 | `PAGE_MAX_LIMIT`           | `100`                                                     | Max allowed `limit` query param                                              |
 | `CACHE_LOCK_TTL`           | `10s`                                                     | Redis lock auto-expire if loader crashes                                     |
-| `CACHE_LOCK_MAX_WAIT`      | `3s`                                                      | Max time lock waiters poll cache before fallback DB load                     |
-| `CACHE_LOCK_POLL_INTERVAL` | `50ms`                                                    | Poll interval while waiting for cache populate                               |
+| `CACHE_LOCK_MAX_WAIT`      | `3s`                                                      | Max time lock waiters block on BRPOP before fallback DB load                   |
 | `IDEMPOTENCY_TTL`          | `24h`                                                     | Dedup window for identical POST `name` + `price_cents` (§3.6 in DESIGN.md)   |
 
 

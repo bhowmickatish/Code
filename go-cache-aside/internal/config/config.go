@@ -17,10 +17,9 @@ type Config struct {
 	RedisClusterAddrs     []string
 	CacheTTL              time.Duration
 	IdempotencyTTL        time.Duration
-	CacheLockTTL          time.Duration
-	CacheLockMaxWait      time.Duration
-	CacheLockPollInterval time.Duration
-	ServerAddr            string
+	CacheLockTTL     time.Duration
+	CacheLockMaxWait time.Duration
+	ServerAddr       string
 	PageDefaultLimit      int
 	PageDefaultOffset     int
 	PageMaxLimit          int
@@ -48,10 +47,6 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	cacheLockPollInterval, err := envDuration("CACHE_LOCK_POLL_INTERVAL", 50*time.Millisecond)
-	if err != nil {
-		return Config{}, err
-	}
 	idempotencyTTL, err := envDuration("IDEMPOTENCY_TTL", 24*time.Hour)
 	if err != nil {
 		return Config{}, err
@@ -66,10 +61,9 @@ func Load() (Config, error) {
 		RedisClusterAddrs:     envCSV("REDIS_CLUSTER_ADDRS", "localhost:6379,localhost:6380,localhost:6381"),
 		CacheTTL:              5 * time.Minute,
 		IdempotencyTTL:        idempotencyTTL,
-		CacheLockTTL:          cacheLockTTL,
-		CacheLockMaxWait:      cacheLockMaxWait,
-		CacheLockPollInterval: cacheLockPollInterval,
-		ServerAddr:            envOrDefault("SERVER_ADDR", ":8080"),
+		CacheLockTTL:     cacheLockTTL,
+		CacheLockMaxWait: cacheLockMaxWait,
+		ServerAddr:       envOrDefault("SERVER_ADDR", ":8080"),
 		PageDefaultLimit:      pageDefaultLimit,
 		PageDefaultOffset:     pageDefaultOffset,
 		PageMaxLimit:          pageMaxLimit,

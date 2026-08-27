@@ -9,4 +9,8 @@ import (
 //go:embed scripts/release_lock.lua
 var releaseLockLua string
 
+//go:embed scripts/set_cache.lua
+var setCacheLua string
+
 var releaseLockScript = redis.NewScript(releaseLockLua)
+var setCacheScript = redis.NewScript(setCacheLua)

@@ -7,12 +7,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const lockKeyPrefix = "lock:"
-
-func LockKey(cacheKey string) string {
-	return lockKeyPrefix + cacheKey
-}
-
 // Lock is a Redis token lock acquired with SET NX EX.
 type Lock struct {
 	client redis.UniversalClient
