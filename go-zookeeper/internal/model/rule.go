@@ -51,10 +51,15 @@ func ParseRulesDocument(data []byte) (RulesDocument, error) {
 	if len(doc.Rules) == 0 {
 		return RulesDocument{}, fmt.Errorf("rules list is empty")
 	}
+	names := make(map[string]struct{}, len(doc.Rules))
 	for i, rule := range doc.Rules {
 		if err := validateRule(rule); err != nil {
 			return RulesDocument{}, fmt.Errorf("rules[%d]: %w", i, err)
 		}
+		if _, exists := names[rule.Name]; exists {
+			return RulesDocument{}, fmt.Errorf("rules[%d]: duplicate rule name %q", i, rule.Name)
+		}
+		names[rule.Name] = struct{}{}
 	}
 	return doc, nil
 }

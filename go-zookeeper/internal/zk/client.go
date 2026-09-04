@@ -8,21 +8,41 @@ import (
 )
 
 type Client struct {
-	conn *zk.Conn
+	conn    *zk.Conn
+	events  <-chan zk.Event
+	openACL bool
+	digest  string
 }
 
-func Connect(addrs []string, sessionTimeout time.Duration) (*Client, error) {
-	conn, _, err := zk.Connect(addrs, sessionTimeout)
+func Connect(addrs []string, sessionTimeout time.Duration, openACL bool, digest string) (*Client, error) {
+	conn, events, err := zk.Connect(addrs, sessionTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("connect zookeeper: %w", err)
 	}
-	return &Client{conn: conn}, nil
+
+	if digest != "" {
+		if err := conn.AddAuth("digest", []byte(digest)); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("zookeeper digest auth: %w", err)
+		}
+	}
+
+	return &Client{
+		conn:    conn,
+		events:  events,
+		openACL: openACL,
+		digest:  digest,
+	}, nil
 }
 
 func (c *Client) Close() {
 	if c.conn != nil {
 		c.conn.Close()
 	}
+}
+
+func (c *Client) Events() <-chan zk.Event {
+	return c.events
 }
 
 func (c *Client) Exists(path string) (bool, error) {
@@ -70,12 +90,34 @@ func (c *Client) CreatePath(path string, data []byte) error {
 		if i == len(parts)-1 {
 			payload = data
 		}
-		_, err = c.conn.Create(current, payload, 0, zk.WorldACL(zk.PermAll))
+		_, err = c.conn.Create(current, payload, 0, c.createACL())
 		if err != nil && err != zk.ErrNodeExists {
 			return fmt.Errorf("create %q: %w", current, err)
 		}
 	}
 	return nil
+}
+
+func (c *Client) createACL() []zk.ACL {
+	if c.openACL {
+		return zk.WorldACL(zk.PermAll)
+	}
+	if c.digest != "" {
+		user, password, ok := splitDigest(c.digest)
+		if ok {
+			return zk.DigestACL(zk.PermAll, user, password)
+		}
+	}
+	return zk.WorldACL(zk.PermRead | zk.PermWrite | zk.PermCreate | zk.PermDelete)
+}
+
+func splitDigest(digest string) (user, password string, ok bool) {
+	for i := 0; i < len(digest); i++ {
+		if digest[i] == ':' {
+			return digest[:i], digest[i+1:], true
+		}
+	}
+	return "", "", false
 }
 
 func (c *Client) Watch(path string) (<-chan zk.Event, error) {

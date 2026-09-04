@@ -2,13 +2,12 @@ package ratelimit
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	uberlimit "go.uber.org/ratelimit"
 
 	"github.com/atish/go-zookeeper/internal/model"
 )
@@ -22,9 +21,11 @@ var (
 var ErrAlreadyInitialized = errors.New("ratelimit: already initialized")
 
 type Limiter struct {
-	mu    sync.RWMutex
-	rules []compiledRule
-	cache sync.Map // ruleName:clientKey -> *limiterEntry
+	mu           sync.RWMutex
+	rules        []compiledRule
+	cache        *entryCache
+	maxWait      time.Duration
+	trustedProxy bool
 }
 
 type compiledRule struct {
@@ -36,7 +37,7 @@ type compiledRule struct {
 }
 
 // Init creates the application-wide limiter. It must be called exactly once.
-func Init(doc model.RulesDocument) (*Limiter, error) {
+func Init(doc model.RulesDocument, maxCacheEntries int, maxWait time.Duration, trustedProxy bool) (*Limiter, error) {
 	initMu.Lock()
 	defer initMu.Unlock()
 
@@ -49,12 +50,16 @@ func Init(doc model.RulesDocument) (*Limiter, error) {
 		return nil, err
 	}
 
-	instance = &Limiter{rules: rules}
+	instance = &Limiter{
+		rules:        rules,
+		cache:        newEntryCache(maxCacheEntries),
+		maxWait:      maxWait,
+		trustedProxy: trustedProxy,
+	}
 	return instance, nil
 }
 
 // Instance returns the application-wide limiter created by Init.
-// All HTTP handlers must use this instance (typically via handler.RateLimitMiddleware).
 func Instance() *Limiter {
 	if instance == nil {
 		panic("ratelimit: Init must be called before Instance")
@@ -80,7 +85,10 @@ func compileRules(doc model.RulesDocument) ([]compiledRule, error) {
 	}
 
 	sort.Slice(compiled, func(i, j int) bool {
-		return len(compiled[i].pathPrefix) > len(compiled[j].pathPrefix)
+		if len(compiled[i].pathPrefix) != len(compiled[j].pathPrefix) {
+			return len(compiled[i].pathPrefix) > len(compiled[j].pathPrefix)
+		}
+		return compiled[i].name < compiled[j].name
 	})
 
 	return compiled, nil
@@ -98,22 +106,27 @@ func (l *Limiter) Update(doc model.RulesDocument) error {
 	return nil
 }
 
-// Allow applies the leaky-bucket limiter for the request. It blocks until a slot
-// is available (go.uber.org/ratelimit only exposes blocking Take).
-func (l *Limiter) Allow(r *http.Request) (allowed bool, ruleName string, retryAfterSec int) {
+// Allow applies leaky-bucket rate limiting. Returns 429 when required wait exceeds maxWait.
+func (l *Limiter) Allow(r *http.Request) (ruleName string, allowed bool, retryAfter time.Duration) {
 	l.mu.RLock()
 	rules := l.rules
+	maxWait := l.maxWait
+	trustedProxy := l.trustedProxy
 	l.mu.RUnlock()
 
 	rule, ok := matchRule(rules, r.URL.Path)
 	if !ok {
-		return true, "", 0
+		return "", true, 0
 	}
 
-	key := limiterKey(rule.key, r)
-	limiter := l.limiterFor(rule.name, key, rule.limit, rule.window)
-	limiter.Take()
-	return true, rule.name, 0
+	key := limiterKey(rule.key, r, trustedProxy)
+	entry := l.cache.get(rule.name+":"+key, rule.limit, rule.window)
+
+	ok, wait := entry.allow(maxWait)
+	if !ok {
+		return rule.name, false, wait
+	}
+	return rule.name, true, 0
 }
 
 func matchRule(rules []compiledRule, path string) (compiledRule, bool) {
@@ -125,47 +138,25 @@ func matchRule(rules []compiledRule, path string) (compiledRule, bool) {
 	return compiledRule{}, false
 }
 
-func limiterKey(strategy model.KeyStrategy, r *http.Request) string {
+func limiterKey(strategy model.KeyStrategy, r *http.Request, trustedProxy bool) string {
 	switch strategy {
 	case model.KeyStrategyGlobal:
 		return "global"
 	default:
-		return clientIP(r)
+		return clientIP(r, trustedProxy)
 	}
 }
 
-func clientIP(r *http.Request) string {
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		parts := strings.Split(forwarded, ",")
-		return strings.TrimSpace(parts[0])
+func clientIP(r *http.Request, trustedProxy bool) string {
+	if trustedProxy {
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			parts := strings.Split(forwarded, ",")
+			return strings.TrimSpace(parts[0])
+		}
 	}
-	host := r.RemoteAddr
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		return host[:idx]
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
 	}
 	return host
-}
-
-type limiterEntry struct {
-	mu      sync.Mutex
-	limiter uberlimit.Limiter
-	limit   int
-	window  time.Duration
-}
-
-func (l *Limiter) limiterFor(ruleName, key string, limit int, window time.Duration) uberlimit.Limiter {
-	cacheKey := ruleName + ":" + key
-
-	entry, _ := l.cache.LoadOrStore(cacheKey, &limiterEntry{})
-	e := entry.(*limiterEntry)
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.limiter == nil || e.limit != limit || e.window != window {
-		e.limiter = uberlimit.New(limit, uberlimit.Per(window), uberlimit.WithoutSlack)
-		e.limit = limit
-		e.window = window
-	}
-	return e.limiter
 }

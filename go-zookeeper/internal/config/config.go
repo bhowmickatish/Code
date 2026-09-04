@@ -3,19 +3,25 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 )
 
 const DefaultAppEnv = "development"
 
 type Config struct {
-	AppEnv            string
-	IsDevelopmentMode bool
-	ZookeeperAddrs    []string
-	RulesPath         string
-	ServerAddr        string
-	ZKSessionTimeout  time.Duration
-	SeedRulesFile     string
+	AppEnv              string
+	IsDevelopmentMode   bool
+	ZookeeperAddrs      []string
+	RulesPath           string
+	ServerAddr          string
+	ZKSessionTimeout    time.Duration
+	SeedRulesFile       string
+	RateLimitCacheMax   int
+	RateLimitMaxWait    time.Duration
+	TrustedProxy        bool
+	ZKOpenACL           bool
+	ZKDigest            string
 }
 
 func Load() (Config, error) {
@@ -26,14 +32,42 @@ func Load() (Config, error) {
 
 	appEnv := envOrDefault("APP_ENV", DefaultAppEnv)
 
+	cacheMax, err := envInt("RATELIMIT_CACHE_MAX", 10_000)
+	if err != nil {
+		return Config{}, err
+	}
+
+	maxWait, err := envDuration("RATELIMIT_MAX_WAIT", 0)
+	if err != nil {
+		return Config{}, err
+	}
+
+	trustedProxy, err := envBool("TRUSTED_PROXY", false)
+	if err != nil {
+		return Config{}, err
+	}
+
+	openACL := appEnv == DefaultAppEnv
+	if v := os.Getenv("ZK_OPEN_ACL"); v != "" {
+		openACL, err = envBool("ZK_OPEN_ACL", openACL)
+		if err != nil {
+			return Config{}, err
+		}
+	}
+
 	return Config{
-		AppEnv:            appEnv,
-		IsDevelopmentMode: appEnv == DefaultAppEnv,
-		ZookeeperAddrs:    envCSV("ZOOKEEPER_ADDRS", "localhost:2181"),
-		RulesPath:         envOrDefault("ZK_RULES_PATH", "/ratelimit/rules"),
-		ServerAddr:        envOrDefault("SERVER_ADDR", ":8080"),
-		ZKSessionTimeout:  sessionTimeout,
-		SeedRulesFile:     envOrDefault("SEED_RULES_FILE", "config/rules.json"),
+		AppEnv:              appEnv,
+		IsDevelopmentMode:   appEnv == DefaultAppEnv,
+		ZookeeperAddrs:      envCSV("ZOOKEEPER_ADDRS", "localhost:2181"),
+		RulesPath:           envOrDefault("ZK_RULES_PATH", "/ratelimit/rules"),
+		ServerAddr:          envOrDefault("SERVER_ADDR", ":8080"),
+		ZKSessionTimeout:    sessionTimeout,
+		SeedRulesFile:       envOrDefault("SEED_RULES_FILE", "config/rules.json"),
+		RateLimitCacheMax:   cacheMax,
+		RateLimitMaxWait:    maxWait,
+		TrustedProxy:        trustedProxy,
+		ZKOpenACL:           openACL,
+		ZKDigest:            os.Getenv("ZK_DIGEST"),
 	}, nil
 }
 
@@ -42,6 +76,30 @@ func envOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envInt(key string, fallback int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer", key)
+	}
+	return n, nil
+}
+
+func envBool(key string, fallback bool) (bool, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+	return b, nil
 }
 
 func envDuration(key string, fallback time.Duration) (time.Duration, error) {

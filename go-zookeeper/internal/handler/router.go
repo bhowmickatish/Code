@@ -2,20 +2,18 @@ package handler
 
 import "net/http"
 
-// RateLimitHandler builds the application HTTP handler wrapped with RateLimitMiddleware.
-// All API modules register on a shared mux so every route uses the singleton limiter.
+// RateLimitHandler builds the application HTTP handler.
+// /health is registered outside rate-limit middleware; API routes are limited.
 func RateLimitHandler() http.Handler {
 	mux := http.NewServeMux()
-
-	registerHealthRoutes(mux)
-	registerUserRoutes(mux)
-	registerOrderRoutes(mux)
-
-	return RateLimitMiddleware()(mux)
-}
-
-func registerHealthRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", health)
+
+	limited := http.NewServeMux()
+	registerUserRoutes(limited)
+	registerOrderRoutes(limited)
+	mux.Handle("/api/", RateLimitMiddleware()(limited))
+
+	return mux
 }
 
 func registerUserRoutes(mux *http.ServeMux) {

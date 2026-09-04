@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,39 +17,38 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		slog.Error("config load failed", "err", err)
+		os.Exit(1)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	zkClient, err := zk.Connect(cfg.ZookeeperAddrs, cfg.ZKSessionTimeout)
-	if err != nil {
-		log.Fatalf("zookeeper: %v", err)
-	}
-	defer zkClient.Close()
-
-	loader := zk.NewLoader(zkClient, cfg.RulesPath, cfg.SeedRulesFile)
-	doc, err := loader.LoadOnStartup(ctx, cfg.IsDevelopmentMode)
-	if err != nil {
-		log.Fatalf("load rules: %v", err)
+	doc, zkClient, loader := loadRules(ctx, cfg)
+	if zkClient != nil {
+		defer zkClient.Close()
 	}
 
-	if _, err := ratelimit.Init(doc); err != nil {
-		log.Fatalf("rate limiter: %v", err)
+	if _, err := ratelimit.Init(doc, cfg.RateLimitCacheMax, cfg.RateLimitMaxWait, cfg.TrustedProxy); err != nil {
+		slog.Error("rate limiter init failed", "err", err)
+		os.Exit(1)
 	}
 
-	go func() {
-		if err := loader.Watch(ctx, func(updated model.RulesDocument) {
-			if err := ratelimit.Instance().Update(updated); err != nil {
-				log.Printf("apply updated rules failed: %v", err)
+	if loader != nil {
+		go func() {
+			if err := loader.Watch(ctx, func(updated model.RulesDocument) {
+				if err := ratelimit.Instance().Update(updated); err != nil {
+					slog.Error("apply updated rules failed", "err", err)
+				}
+			}); err != nil && err != context.Canceled {
+				slog.Warn("zookeeper watch stopped", "err", err)
 			}
-		}); err != nil && err != context.Canceled {
-			log.Printf("zookeeper watch stopped: %v", err)
-		}
-	}()
+		}()
+	}
 
 	server := &http.Server{
 		Addr:         cfg.ServerAddr,
@@ -59,19 +58,52 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("APP_ENV=%s listening on %s (zookeeper=%v rules_path=%s)",
-			cfg.AppEnv, cfg.ServerAddr, cfg.ZookeeperAddrs, cfg.RulesPath)
+		slog.Info("server listening",
+			"app_env", cfg.AppEnv,
+			"addr", cfg.ServerAddr,
+			"zookeeper", cfg.ZookeeperAddrs,
+			"rules_path", cfg.RulesPath,
+		)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server: %v", err)
+			slog.Error("server failed", "err", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-ctx.Done()
-	log.Printf("shutting down")
+	slog.Info("shutting down")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v", err)
+		slog.Warn("shutdown error", "err", err)
 	}
+}
+
+func loadRules(ctx context.Context, cfg config.Config) (model.RulesDocument, *zk.Client, *zk.Loader) {
+	loadCtx, cancel := context.WithTimeout(ctx, cfg.ZKSessionTimeout)
+	defer cancel()
+
+	zkClient, err := zk.Connect(cfg.ZookeeperAddrs, cfg.ZKSessionTimeout, cfg.ZKOpenACL, cfg.ZKDigest)
+	if err != nil {
+		slog.Warn("zookeeper connect failed, using fallback rules file",
+			"file", cfg.SeedRulesFile,
+			"err", err,
+		)
+		doc, err := zk.LoadRulesFromFile(cfg.SeedRulesFile)
+		if err != nil {
+			slog.Error("load rules failed", "err", err)
+			os.Exit(1)
+		}
+		return doc, nil, nil
+	}
+
+	loader := zk.NewLoader(zkClient, cfg.RulesPath, cfg.SeedRulesFile)
+	doc, err := loader.LoadOnStartup(loadCtx, cfg.IsDevelopmentMode)
+	if err != nil {
+		zkClient.Close()
+		slog.Error("load rules failed", "err", err)
+		os.Exit(1)
+	}
+	return doc, zkClient, loader
 }
