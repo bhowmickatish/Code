@@ -7,32 +7,18 @@ import (
 	"github.com/atish/go-zookeeper/internal/ratelimit"
 )
 
-type API struct {
-	limiter *ratelimit.Limiter
-}
-
-func NewAPI(limiter *ratelimit.Limiter) *API {
-	return &API{limiter: limiter}
-}
-
-func (a *API) Register(mux *http.ServeMux) {
-	mux.HandleFunc("/health", a.health)
-	mux.HandleFunc("/api/users", a.users)
-	mux.HandleFunc("/api/orders", a.orders)
-}
-
-func (a *API) health(w http.ResponseWriter, r *http.Request) {
+func health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (a *API) users(w http.ResponseWriter, r *http.Request) {
+func users(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"resource": "users",
 		"message":  "sample endpoint protected by zookeeper-backed rate limits",
 	})
 }
 
-func (a *API) orders(w http.ResponseWriter, r *http.Request) {
+func orders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"resource": "orders",
 		"message":  "falls back to api-default rule (longer path prefix wins)",
@@ -45,10 +31,12 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func RateLimitMiddleware(limiter *ratelimit.Limiter) func(http.Handler) http.Handler {
+// RateLimitMiddleware applies the application-wide limiter to every request.
+// All API modules share ratelimit.Instance() via this middleware.
+func RateLimitMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, ruleName, _ := limiter.Allow(r)
+			_, ruleName, _ := ratelimit.Instance().Allow(r)
 			if ruleName != "" {
 				w.Header().Set("X-RateLimit-Rule", ruleName)
 			}

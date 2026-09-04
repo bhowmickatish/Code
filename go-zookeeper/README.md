@@ -9,13 +9,14 @@ Startup
   1. Connect to ZooKeeper
   2. If /ratelimit/rules is missing (development only), seed from config/rules.json
   3. Load and validate rules JSON
-  4. Build leaky-bucket limiters via go.uber.org/ratelimit (longest path_prefix wins)
+  4. Init singleton limiter (one instance per application)
   5. Watch /ratelimit/rules for changes → reload without restart
 
 HTTP request
-  1. Match rule by path prefix
-  2. Resolve limiter key (ip or global)
-  3. Block on limiter.Take() until a slot is available (leaky bucket, no burst)
+  1. All routes go through handler.RateLimitHandler() → RateLimitMiddleware → ratelimit.Instance()
+  2. Match rule by path prefix
+  3. Resolve limiter key (ip or global) on the shared instance
+  4. Block on limiter.Take() until a slot is available (leaky bucket, no burst)
 ```
 
 ZooKeeper stores a single JSON document at `ZK_RULES_PATH` (default `/ratelimit/rules`):

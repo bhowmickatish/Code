@@ -37,14 +37,13 @@ func main() {
 		log.Fatalf("load rules: %v", err)
 	}
 
-	limiter, err := ratelimit.NewLimiter(doc)
-	if err != nil {
+	if _, err := ratelimit.Init(doc); err != nil {
 		log.Fatalf("rate limiter: %v", err)
 	}
 
 	go func() {
 		if err := loader.Watch(ctx, func(updated model.RulesDocument) {
-			if err := limiter.Update(updated); err != nil {
+			if err := ratelimit.Instance().Update(updated); err != nil {
 				log.Printf("apply updated rules failed: %v", err)
 			}
 		}); err != nil && err != context.Canceled {
@@ -52,13 +51,9 @@ func main() {
 		}
 	}()
 
-	api := handler.NewAPI(limiter)
-	mux := http.NewServeMux()
-	api.Register(mux)
-
 	server := &http.Server{
 		Addr:         cfg.ServerAddr,
-		Handler:      handler.RateLimitMiddleware(limiter)(mux),
+		Handler:      handler.RateLimitHandler(),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}

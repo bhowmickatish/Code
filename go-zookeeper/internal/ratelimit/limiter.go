@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
@@ -12,9 +13,18 @@ import (
 	"github.com/atish/go-zookeeper/internal/model"
 )
 
+var (
+	instance *Limiter
+	initMu   sync.Mutex
+)
+
+// ErrAlreadyInitialized is returned when Init is called more than once.
+var ErrAlreadyInitialized = errors.New("ratelimit: already initialized")
+
 type Limiter struct {
 	mu    sync.RWMutex
 	rules []compiledRule
+	cache sync.Map // ruleName:clientKey -> *limiterEntry
 }
 
 type compiledRule struct {
@@ -25,7 +35,34 @@ type compiledRule struct {
 	key        model.KeyStrategy
 }
 
-func NewLimiter(doc model.RulesDocument) (*Limiter, error) {
+// Init creates the application-wide limiter. It must be called exactly once.
+func Init(doc model.RulesDocument) (*Limiter, error) {
+	initMu.Lock()
+	defer initMu.Unlock()
+
+	if instance != nil {
+		return nil, ErrAlreadyInitialized
+	}
+
+	rules, err := compileRules(doc)
+	if err != nil {
+		return nil, err
+	}
+
+	instance = &Limiter{rules: rules}
+	return instance, nil
+}
+
+// Instance returns the application-wide limiter created by Init.
+// All HTTP handlers must use this instance (typically via handler.RateLimitMiddleware).
+func Instance() *Limiter {
+	if instance == nil {
+		panic("ratelimit: Init must be called before Instance")
+	}
+	return instance
+}
+
+func compileRules(doc model.RulesDocument) ([]compiledRule, error) {
 	compiled := make([]compiledRule, 0, len(doc.Rules))
 	for _, rule := range doc.Rules {
 		window, err := rule.WindowDuration()
@@ -46,17 +83,17 @@ func NewLimiter(doc model.RulesDocument) (*Limiter, error) {
 		return len(compiled[i].pathPrefix) > len(compiled[j].pathPrefix)
 	})
 
-	return &Limiter{rules: compiled}, nil
+	return compiled, nil
 }
 
 func (l *Limiter) Update(doc model.RulesDocument) error {
-	next, err := NewLimiter(doc)
+	rules, err := compileRules(doc)
 	if err != nil {
 		return err
 	}
 
 	l.mu.Lock()
-	l.rules = next.rules
+	l.rules = rules
 	l.mu.Unlock()
 	return nil
 }
@@ -109,8 +146,6 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-var limiterCache sync.Map
-
 type limiterEntry struct {
 	mu      sync.Mutex
 	limiter uberlimit.Limiter
@@ -121,7 +156,7 @@ type limiterEntry struct {
 func (l *Limiter) limiterFor(ruleName, key string, limit int, window time.Duration) uberlimit.Limiter {
 	cacheKey := ruleName + ":" + key
 
-	entry, _ := limiterCache.LoadOrStore(cacheKey, &limiterEntry{})
+	entry, _ := l.cache.LoadOrStore(cacheKey, &limiterEntry{})
 	e := entry.(*limiterEntry)
 
 	e.mu.Lock()
