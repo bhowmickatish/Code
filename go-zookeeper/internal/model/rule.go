@@ -10,6 +10,7 @@ type KeyStrategy string
 
 const (
 	KeyStrategyIP     KeyStrategy = "ip"
+	KeyStrategyUser   KeyStrategy = "user"
 	KeyStrategyGlobal KeyStrategy = "global"
 )
 
@@ -78,9 +79,9 @@ func validateRule(rule RateLimit) error {
 		return err
 	}
 	switch rule.Key {
-	case KeyStrategyIP, KeyStrategyGlobal:
+	case KeyStrategyIP, KeyStrategyUser, KeyStrategyGlobal:
 	default:
-		return fmt.Errorf("key must be %q or %q", KeyStrategyIP, KeyStrategyGlobal)
+		return fmt.Errorf("key must be %q, %q, or %q", KeyStrategyIP, KeyStrategyUser, KeyStrategyGlobal)
 	}
 	return nil
 }

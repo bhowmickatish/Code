@@ -33,8 +33,10 @@ main
 - **Single state machine** per bucket (`nextIssue`) — peek and commit share state (no mirror drift)
 - **Bounded wait:** `RATELIMIT_MAX_WAIT` — wait up to N, else **429** + `Retry-After`
 - **Rule matching:** longest `path_prefix` wins; same-length prefixes tie-break by rule `name` (stable)
-- **Keys:** `ip` (per client) or `global`
+- **Keys:** `ip` (per client), `user` (per authenticated user), or `global` (one shared bucket for the rule’s path scope)
+- **Sample rules:** `api-default` (per-IP on `/api/`), `users` (per-user on `/api/users`), `orders-global` (shared cap on `/api/orders`)
 - **Client IP:** `RemoteAddr` by default; `X-Forwarded-For` only when `TRUSTED_PROXY=true`
+- **User key:** reads `RATELIMIT_USER_HEADER` (default `X-User-ID`); falls back to per-IP when header is missing
 
 ### In-process cache (placeholder)
 

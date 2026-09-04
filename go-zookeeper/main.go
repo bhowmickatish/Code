@@ -33,7 +33,7 @@ func main() {
 		defer zkClient.Close()
 	}
 
-	if _, err := ratelimit.Init(doc, cfg.RateLimitCacheMax, cfg.RateLimitMaxWait, cfg.TrustedProxy); err != nil {
+	if _, err := ratelimit.Init(doc, cfg.RateLimitCacheMax, cfg.RateLimitMaxWait, cfg.TrustedProxy, cfg.RateLimitUserHeader); err != nil {
 		slog.Error("rate limiter init failed", "err", err)
 		os.Exit(1)
 	}

@@ -15,7 +15,7 @@ func ResetForTest(t *testing.T, doc model.RulesDocument, maxCacheEntries int, ma
 	instance = nil
 	initMu.Unlock()
 
-	limiter, err := Init(doc, maxCacheEntries, maxWait, trustedProxy)
+	limiter, err := Init(doc, maxCacheEntries, maxWait, trustedProxy, "")
 	if err != nil {
 		t.Fatalf("init test limiter: %v", err)
 	}

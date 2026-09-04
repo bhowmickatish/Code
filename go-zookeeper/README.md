@@ -38,7 +38,9 @@ go run .
 ```bash
 curl http://localhost:8080/health          # never rate-limited
 curl http://localhost:8080/api/users
-curl http://localhost:8080/api/orders
+curl -H "X-User-ID: alice" http://localhost:8080/api/users   # per-user bucket (users rule)
+curl http://localhost:8080/api/orders                          # global bucket (orders-global rule)
+curl http://localhost:8080/api/other                           # per-ip bucket (api-default rule)
 ```
 
 ## Configuration
@@ -54,6 +56,7 @@ curl http://localhost:8080/api/orders
 | `SEED_RULES_FILE`     | `config/rules.json`  | Bootstrap + fallback rules file (**required**)   |
 | `RATELIMIT_CACHE_MAX` | `10000`              | In-process LRU cache (placeholder for Redis)     |
 | `RATELIMIT_MAX_WAIT`  | `0`                  | Max wait before 429 (`0` = reject immediately)   |
+| `RATELIMIT_USER_HEADER` | `X-User-ID`        | Header for `key: "user"` rules                   |
 | `TRUSTED_PROXY`       | `false`              | Trust `X-Forwarded-For` for IP keys              |
 | `SERVER_ADDR`         | `:8080`              | HTTP listen address                              |
 

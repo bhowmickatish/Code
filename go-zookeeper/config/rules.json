@@ -13,7 +13,14 @@
       "path_prefix": "/api/users",
       "limit": 10,
       "window": "1s",
-      "key": "ip"
+      "key": "user"
+    },
+    {
+      "name": "orders-global",
+      "path_prefix": "/api/orders",
+      "limit": 50,
+      "window": "1m",
+      "key": "global"
     }
   ]
 }

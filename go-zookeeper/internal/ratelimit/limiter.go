@@ -26,6 +26,7 @@ type Limiter struct {
 	cache        *entryCache
 	maxWait      time.Duration
 	trustedProxy bool
+	userHeader   string
 }
 
 type compiledRule struct {
@@ -37,7 +38,7 @@ type compiledRule struct {
 }
 
 // Init creates the application-wide limiter. It must be called exactly once.
-func Init(doc model.RulesDocument, maxCacheEntries int, maxWait time.Duration, trustedProxy bool) (*Limiter, error) {
+func Init(doc model.RulesDocument, maxCacheEntries int, maxWait time.Duration, trustedProxy bool, userHeader string) (*Limiter, error) {
 	initMu.Lock()
 	defer initMu.Unlock()
 
@@ -50,11 +51,16 @@ func Init(doc model.RulesDocument, maxCacheEntries int, maxWait time.Duration, t
 		return nil, err
 	}
 
+	if userHeader == "" {
+		userHeader = "X-User-ID"
+	}
+
 	instance = &Limiter{
 		rules:        rules,
 		cache:        newEntryCache(maxCacheEntries),
 		maxWait:      maxWait,
 		trustedProxy: trustedProxy,
+		userHeader:   userHeader,
 	}
 	return instance, nil
 }
@@ -112,6 +118,7 @@ func (l *Limiter) Allow(r *http.Request) (ruleName string, allowed bool, retryAf
 	rules := l.rules
 	maxWait := l.maxWait
 	trustedProxy := l.trustedProxy
+	userHeader := l.userHeader
 	l.mu.RUnlock()
 
 	rule, ok := matchRule(rules, r.URL.Path)
@@ -119,7 +126,7 @@ func (l *Limiter) Allow(r *http.Request) (ruleName string, allowed bool, retryAf
 		return "", true, 0
 	}
 
-	key := limiterKey(rule.key, r, trustedProxy)
+	key := limiterKey(rule.key, r, trustedProxy, userHeader)
 	entry := l.cache.get(rule.name+":"+key, rule.limit, rule.window)
 
 	ok, wait := entry.allow(maxWait)
@@ -138,13 +145,22 @@ func matchRule(rules []compiledRule, path string) (compiledRule, bool) {
 	return compiledRule{}, false
 }
 
-func limiterKey(strategy model.KeyStrategy, r *http.Request, trustedProxy bool) string {
+func limiterKey(strategy model.KeyStrategy, r *http.Request, trustedProxy bool, userHeader string) string {
 	switch strategy {
 	case model.KeyStrategyGlobal:
 		return "global"
+	case model.KeyStrategyUser:
+		if userID := clientUser(r, userHeader); userID != "" {
+			return "user:" + userID
+		}
+		return "ip:" + clientIP(r, trustedProxy)
 	default:
-		return clientIP(r, trustedProxy)
+		return "ip:" + clientIP(r, trustedProxy)
 	}
+}
+
+func clientUser(r *http.Request, header string) string {
+	return strings.TrimSpace(r.Header.Get(header))
 }
 
 func clientIP(r *http.Request, trustedProxy bool) string {

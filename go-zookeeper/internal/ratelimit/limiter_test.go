@@ -1,10 +1,32 @@
 package ratelimit
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/atish/go-zookeeper/internal/model"
 )
+
+func TestLimiterKeyUser(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	req.Header.Set("X-User-ID", "alice")
+
+	key := limiterKey(model.KeyStrategyUser, req, false, "X-User-ID")
+	if key != "user:alice" {
+		t.Fatalf("expected user:alice, got %q", key)
+	}
+}
+
+func TestLimiterKeyUserFallsBackToIP(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	req.RemoteAddr = "203.0.113.5:1234"
+
+	key := limiterKey(model.KeyStrategyUser, req, false, "X-User-ID")
+	if key != "ip:203.0.113.5" {
+		t.Fatalf("expected ip fallback, got %q", key)
+	}
+}
 
 func TestMatchRuleLongestPrefixWins(t *testing.T) {
 	doc := model.RulesDocument{

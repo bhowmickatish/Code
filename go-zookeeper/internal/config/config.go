@@ -19,6 +19,7 @@ type Config struct {
 	SeedRulesFile       string
 	RateLimitCacheMax   int
 	RateLimitMaxWait    time.Duration
+	RateLimitUserHeader string
 	TrustedProxy        bool
 	ZKOpenACL           bool
 	ZKDigest            string
@@ -65,6 +66,7 @@ func Load() (Config, error) {
 		SeedRulesFile:       envOrDefault("SEED_RULES_FILE", "config/rules.json"),
 		RateLimitCacheMax:   cacheMax,
 		RateLimitMaxWait:    maxWait,
+		RateLimitUserHeader: envOrDefault("RATELIMIT_USER_HEADER", "X-User-ID"),
 		TrustedProxy:        trustedProxy,
 		ZKOpenACL:           openACL,
 		ZKDigest:            os.Getenv("ZK_DIGEST"),

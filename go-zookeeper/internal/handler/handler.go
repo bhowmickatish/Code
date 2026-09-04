@@ -22,7 +22,7 @@ func users(w http.ResponseWriter, r *http.Request) {
 func orders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"resource": "orders",
-		"message":  "falls back to api-default rule (longer path prefix wins)",
+		"message":  "protected by orders-global rule (shared bucket for all clients)",
 	})
 }
 
