@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "name": "api-default",
+      "path_prefix": "/api/",
+      "limit": 100,
+      "window": "1m",
+      "key": "ip"
+    },
+    {
+      "name": "users",
+      "path_prefix": "/api/users",
+      "limit": 10,
+      "window": "1s",
+      "key": "ip"
+    },
+    {
+      "name": "health",
+      "path_prefix": "/health",
+      "limit": 1000,
+      "window": "1m",
+      "key": "global"
+    }
+  ]
+}
