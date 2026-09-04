@@ -7,43 +7,7 @@ import (
 	uberlimit "go.uber.org/ratelimit"
 )
 
-func TestLimiterEntryRejectsWhenMaxWaitZero(t *testing.T) {
-	entry := &limiterEntry{}
-	entry.configure(2, time.Second)
-
-	allowed, _ := entry.allow(0)
-	if !allowed {
-		t.Fatal("first request should be allowed")
-	}
-
-	allowed, wait := entry.allow(0)
-	if allowed || wait <= 0 {
-		t.Fatalf("second immediate request should be rejected, got allowed=%v wait=%v", allowed, wait)
-	}
-}
-
-func TestLimiterEntryWaitsWithinMaxWait(t *testing.T) {
-	entry := &limiterEntry{}
-	entry.configure(2, time.Second)
-
-	allowed, _ := entry.allow(time.Second)
-	if !allowed {
-		t.Fatal("first request should be allowed")
-	}
-
-	start := time.Now()
-	allowed, _ = entry.allow(600 * time.Millisecond)
-	elapsed := time.Since(start)
-
-	if !allowed {
-		t.Fatal("second request should be allowed within max wait")
-	}
-	if elapsed < 400*time.Millisecond {
-		t.Fatalf("expected ~500ms wait, got %v", elapsed)
-	}
-}
-
-func TestLimiterEntryMatchesUberSpacing(t *testing.T) {
+func TestLimiterEntryUsesUberSpacing(t *testing.T) {
 	uberElapsed := measureUberSpacing()
 	entryElapsed := measureEntrySpacing()
 
@@ -66,9 +30,9 @@ func measureUberSpacing() time.Duration {
 func measureEntrySpacing() time.Duration {
 	entry := &limiterEntry{}
 	entry.configure(2, time.Second)
-	entry.allow(time.Second)
+	entry.take()
 	start := time.Now()
-	entry.allow(time.Second)
+	entry.take()
 	return time.Since(start)
 }
 

@@ -29,9 +29,7 @@ main
 
 ## Rate limiting
 
-- **Algorithm:** leaky bucket (WithoutSlack), equivalent to `go.uber.org/ratelimit`
-- **Single state machine** per bucket (`nextIssue`) — peek and commit share state (no mirror drift)
-- **Bounded wait:** `RATELIMIT_MAX_WAIT` — wait up to N, else **429** + `Retry-After`
+- **Algorithm:** `go.uber.org/ratelimit` leaky bucket (`WithoutSlack`); over-limit requests block via `Take()`
 - **Rule matching:** longest `path_prefix` wins; same-length prefixes tie-break by rule `name` (stable)
 - **Keys:** `ip` (per client), `user` (per authenticated user), or `global` (one shared bucket for the rule’s path scope)
 - **Sample rules:** `api-default` (per-IP on `/api/`), `users` (per-user on `/api/users`), `orders-global` (shared cap on `/api/orders`)

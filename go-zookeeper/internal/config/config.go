@@ -18,7 +18,6 @@ type Config struct {
 	ZKSessionTimeout    time.Duration
 	SeedRulesFile       string
 	RateLimitCacheMax   int
-	RateLimitMaxWait    time.Duration
 	RateLimitUserHeader string
 	TrustedProxy        bool
 	ZKOpenACL           bool
@@ -34,11 +33,6 @@ func Load() (Config, error) {
 	appEnv := envOrDefault("APP_ENV", DefaultAppEnv)
 
 	cacheMax, err := envInt("RATELIMIT_CACHE_MAX", 10_000)
-	if err != nil {
-		return Config{}, err
-	}
-
-	maxWait, err := envDuration("RATELIMIT_MAX_WAIT", 0)
 	if err != nil {
 		return Config{}, err
 	}
@@ -65,7 +59,6 @@ func Load() (Config, error) {
 		ZKSessionTimeout:    sessionTimeout,
 		SeedRulesFile:       envOrDefault("SEED_RULES_FILE", "config/rules.json"),
 		RateLimitCacheMax:   cacheMax,
-		RateLimitMaxWait:    maxWait,
 		RateLimitUserHeader: envOrDefault("RATELIMIT_USER_HEADER", "X-User-ID"),
 		TrustedProxy:        trustedProxy,
 		ZKOpenACL:           openACL,

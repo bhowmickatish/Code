@@ -24,7 +24,6 @@ type Limiter struct {
 	mu           sync.RWMutex
 	rules        []compiledRule
 	cache        *entryCache
-	maxWait      time.Duration
 	trustedProxy bool
 	userHeader   string
 }
@@ -38,7 +37,7 @@ type compiledRule struct {
 }
 
 // Init creates the application-wide limiter. It must be called exactly once.
-func Init(doc model.RulesDocument, maxCacheEntries int, maxWait time.Duration, trustedProxy bool, userHeader string) (*Limiter, error) {
+func Init(doc model.RulesDocument, maxCacheEntries int, trustedProxy bool, userHeader string) (*Limiter, error) {
 	initMu.Lock()
 	defer initMu.Unlock()
 
@@ -58,7 +57,6 @@ func Init(doc model.RulesDocument, maxCacheEntries int, maxWait time.Duration, t
 	instance = &Limiter{
 		rules:        rules,
 		cache:        newEntryCache(maxCacheEntries),
-		maxWait:      maxWait,
 		trustedProxy: trustedProxy,
 		userHeader:   userHeader,
 	}
@@ -112,28 +110,24 @@ func (l *Limiter) Update(doc model.RulesDocument) error {
 	return nil
 }
 
-// Allow applies leaky-bucket rate limiting. Returns 429 when required wait exceeds maxWait.
-func (l *Limiter) Allow(r *http.Request) (ruleName string, allowed bool, retryAfter time.Duration) {
+// Allow applies leaky-bucket rate limiting via go.uber.org/ratelimit.
+// Over-limit requests block until a slot is available (Take semantics).
+func (l *Limiter) Allow(r *http.Request) string {
 	l.mu.RLock()
 	rules := l.rules
-	maxWait := l.maxWait
 	trustedProxy := l.trustedProxy
 	userHeader := l.userHeader
 	l.mu.RUnlock()
 
 	rule, ok := matchRule(rules, r.URL.Path)
 	if !ok {
-		return "", true, 0
+		return ""
 	}
 
 	key := limiterKey(rule.key, r, trustedProxy, userHeader)
 	entry := l.cache.get(rule.name+":"+key, rule.limit, rule.window)
-
-	ok, wait := entry.allow(maxWait)
-	if !ok {
-		return rule.name, false, wait
-	}
-	return rule.name, true, 0
+	entry.take()
+	return rule.name
 }
 
 func matchRule(rules []compiledRule, path string) (compiledRule, bool) {

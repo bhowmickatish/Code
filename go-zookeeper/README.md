@@ -18,7 +18,7 @@ HTTP request
   1. /health → no rate limit
   2. /api/* → RateLimitMiddleware → ratelimit.Instance()
   3. Match rule by path prefix (longest wins)
-  4. Leaky bucket: wait up to RATELIMIT_MAX_WAIT, else 429
+  4. Leaky bucket via go.uber.org/ratelimit (blocks until allowed)
 ```
 
 ## Prerequisites
@@ -55,7 +55,6 @@ curl http://localhost:8080/api/other                           # per-ip bucket (
 | `ZK_DIGEST`           | _(empty)_            | `user:password` for digest ACL when ACL not open |
 | `SEED_RULES_FILE`     | `config/rules.json`  | Bootstrap + fallback rules file (**required**)   |
 | `RATELIMIT_CACHE_MAX` | `10000`              | In-process LRU cache (placeholder for Redis)     |
-| `RATELIMIT_MAX_WAIT`  | `0`                  | Max wait before 429 (`0` = reject immediately)   |
 | `RATELIMIT_USER_HEADER` | `X-User-ID`        | Header for `key: "user"` rules                   |
 | `TRUSTED_PROXY`       | `false`              | Trust `X-Forwarded-For` for IP keys              |
 | `SERVER_ADDR`         | `:8080`              | HTTP listen address                              |
