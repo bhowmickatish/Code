@@ -52,7 +52,15 @@ func (l *Loader) LoadOnStartup(ctx context.Context, bootstrap bool) (model.Rules
 	return doc, nil
 }
 
-func (l *Loader) Watch(ctx context.Context, onReload func(model.RulesDocument)) error {
+type ReloadFunc func(model.RulesDocument) error
+
+func applyReload(onReload ReloadFunc, doc model.RulesDocument) {
+	if err := onReload(doc); err != nil {
+		slog.Error("apply rate limit rules failed", "err", err)
+	}
+}
+
+func (l *Loader) Watch(ctx context.Context, onReload ReloadFunc) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -74,8 +82,8 @@ func (l *Loader) Watch(ctx context.Context, onReload func(model.RulesDocument)) 
 				return ctx.Err()
 
 			case sessEvent := <-l.client.Events():
-				if handled := l.handleSessionEvent(sessEvent, onReload); handled {
-					return nil
+				if l.handleSessionEvent(sessEvent, onReload) {
+					goto rewatch
 				}
 
 			case event := <-ch:
@@ -88,7 +96,9 @@ func (l *Loader) Watch(ctx context.Context, onReload func(model.RulesDocument)) 
 	}
 }
 
-func (l *Loader) handleSessionEvent(event gzk.Event, onReload func(model.RulesDocument)) bool {
+// handleSessionEvent handles session lifecycle events. Returns true when the node
+// watch should be re-registered (e.g. after session expiry).
+func (l *Loader) handleSessionEvent(event gzk.Event, onReload ReloadFunc) bool {
 	if event.Type != gzk.EventSession {
 		return false
 	}
@@ -101,12 +111,13 @@ func (l *Loader) handleSessionEvent(event gzk.Event, onReload func(model.RulesDo
 	case gzk.StateDisconnected:
 		slog.Warn("zookeeper disconnected, waiting for reconnect")
 	case gzk.StateConnected:
-		slog.Info("zookeeper session connected")
+		slog.Info("zookeeper session connected, reloading rules from zookeeper")
+		l.reloadFromZK(onReload)
 	}
 	return false
 }
 
-func (l *Loader) handleNodeEvent(event gzk.Event, onReload func(model.RulesDocument)) bool {
+func (l *Loader) handleNodeEvent(event gzk.Event, onReload ReloadFunc) bool {
 	switch event.Type {
 	case gzk.EventNodeDataChanged, gzk.EventNodeCreated:
 		l.reloadFromZK(onReload)
@@ -121,23 +132,23 @@ func (l *Loader) handleNodeEvent(event gzk.Event, onReload func(model.RulesDocum
 	return false
 }
 
-func (l *Loader) reloadFromZK(onReload func(model.RulesDocument)) {
+func (l *Loader) reloadFromZK(onReload ReloadFunc) {
 	doc, err := l.load()
 	if err != nil {
 		slog.Warn("reload rules from zookeeper failed, keeping current rules", "err", err)
 		return
 	}
 	slog.Info("reloaded rate limit rules from zookeeper", "count", len(doc.Rules), "version", doc.Version)
-	onReload(doc)
+	applyReload(onReload, doc)
 }
 
-func (l *Loader) applyFallback(onReload func(model.RulesDocument)) {
+func (l *Loader) applyFallback(onReload ReloadFunc) {
 	doc, err := LoadRulesFromFile(l.seedFile)
 	if err != nil {
 		slog.Error("fallback rules file unavailable", "file", l.seedFile, "err", err)
 		return
 	}
-	onReload(doc)
+	applyReload(onReload, doc)
 }
 
 func sleepOrDone(ctx context.Context, d time.Duration) bool {

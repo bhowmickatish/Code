@@ -1,22 +1,23 @@
 package ratelimit
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/atish/go-zookeeper/internal/model"
 )
 
 // ResetForTest re-initializes the singleton limiter for tests.
-func ResetForTest(t *testing.T, doc model.RulesDocument, maxCacheEntries int, trustedProxy bool) *Limiter {
+func ResetForTest(t *testing.T, doc model.RulesDocument) *Limiter {
 	t.Helper()
 
-	initMu.Lock()
+	instanceMu.Lock()
 	instance = nil
-	initMu.Unlock()
+	instanceMu.Unlock()
+	initOnce = sync.Once{}
 
-	limiter, err := Init(doc, maxCacheEntries, trustedProxy, "")
-	if err != nil {
-		t.Fatalf("init test limiter: %v", err)
+	if err := Instance().Update(doc); err != nil {
+		t.Fatalf("update test rules: %v", err)
 	}
-	return limiter
+	return Instance()
 }

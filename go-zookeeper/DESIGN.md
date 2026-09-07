@@ -12,10 +12,10 @@ A sample service that loads **rate-limit rules from ZooKeeper**, applies **leaky
 main
   ├── config          env-based settings
   ├── zk.Loader       rules from ZK + fallback file + watch
-  ├── ratelimit.Init  singleton limiter (one per process)
+  ├── ratelimit.Instance().Update  startup rules + ZK hot-reload
   └── handler.RateLimitHandler
         ├── /health           (no rate limit)
-        └── /api/* + middleware → ratelimit.Instance()
+        └── /api/* + middleware → ratelimit.Instance().Allow
 ```
 
 ## Rules source of truth
@@ -44,7 +44,7 @@ Replace with Redis (or similar) when you need cluster-wide limits.
 
 ## ZooKeeper
 
-- **Watch:** reload on data change; fallback file on node delete, watch loss, session expiry
+- **Watch:** reload on data change; fallback file on node delete; re-register watch after session expiry or watch loss; reload from ZK on reconnect
 - **ACLs:** `ZK_OPEN_ACL=true` (default in development) uses `WorldACL(PermAll)` for bootstrap
 - **Production:** set `ZK_OPEN_ACL=false` and `ZK_DIGEST=user:password` for digest ACL + `AddAuth`
 

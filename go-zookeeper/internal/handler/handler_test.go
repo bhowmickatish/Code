@@ -18,7 +18,7 @@ func TestRateLimitMiddlewareThrottles(t *testing.T) {
 		},
 	}
 
-	instance := ratelimit.ResetForTest(t, doc, 100, false)
+	instance := ratelimit.ResetForTest(t, doc)
 
 	handler := RateLimitMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -56,7 +56,7 @@ func TestHealthBypassesRateLimitMiddleware(t *testing.T) {
 			{Name: "test", PathPrefix: "/", Limit: 1, Window: "1s", Key: model.KeyStrategyGlobal},
 		},
 	}
-	ratelimit.ResetForTest(t, doc, 100, false)
+	ratelimit.ResetForTest(t, doc)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", health)

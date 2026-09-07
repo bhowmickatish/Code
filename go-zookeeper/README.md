@@ -11,8 +11,8 @@ Startup
   1. Connect to ZooKeeper (with timeout via context)
   2. If ZK unavailable → fall back to config/rules.json
   3. If /ratelimit/rules is missing (development only), seed from config/rules.json
-  4. Init singleton limiter (one instance per application)
-  5. Watch /ratelimit/rules for changes → reload; fallback on delete/session loss
+  4. ratelimit.Instance().Update(doc) before HTTP listens
+  5. Watch /ratelimit/rules → Instance().Update on change; fallback on delete/session loss
 
 HTTP request
   1. /health → no rate limit

@@ -1,7 +1,6 @@
 package ratelimit
 
 import (
-	"errors"
 	"net"
 	"net/http"
 	"sort"
@@ -9,16 +8,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/atish/go-zookeeper/internal/config"
 	"github.com/atish/go-zookeeper/internal/model"
 )
 
 var (
-	instance *Limiter
-	initMu   sync.Mutex
+	instance   *Limiter
+	instanceMu sync.RWMutex
+	initOnce   sync.Once
 )
-
-// ErrAlreadyInitialized is returned when Init is called more than once.
-var ErrAlreadyInitialized = errors.New("ratelimit: already initialized")
 
 type Limiter struct {
 	mu           sync.RWMutex
@@ -36,39 +34,48 @@ type compiledRule struct {
 	key        model.KeyStrategy
 }
 
-// Init creates the application-wide limiter. It must be called exactly once.
-func Init(doc model.RulesDocument, maxCacheEntries int, trustedProxy bool, userHeader string) (*Limiter, error) {
-	initMu.Lock()
-	defer initMu.Unlock()
+// Instance returns the application-wide limiter singleton.
+func Instance() *Limiter {
+	initOnce.Do(func() {
+		maxCache, trustedProxy, userHeader := loadSettings()
+		instanceMu.Lock()
+		instance = &Limiter{
+			cache:        newEntryCache(maxCache),
+			trustedProxy: trustedProxy,
+			userHeader:   userHeader,
+		}
+		instanceMu.Unlock()
+	})
 
-	if instance != nil {
-		return nil, ErrAlreadyInitialized
-	}
+	instanceMu.RLock()
+	defer instanceMu.RUnlock()
+	return instance
+}
 
+// Update hot-reloads rate limit rules on the limiter.
+func (l *Limiter) Update(doc model.RulesDocument) error {
 	rules, err := compileRules(doc)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
+	l.mu.Lock()
+	l.rules = rules
+	l.mu.Unlock()
+	return nil
+}
+
+func loadSettings() (maxCache int, trustedProxy bool, userHeader string) {
+	cfg, err := config.Load()
+	if err != nil {
+		return defaultCacheMax, false, "X-User-ID"
+	}
+
+	userHeader = cfg.RateLimitUserHeader
 	if userHeader == "" {
 		userHeader = "X-User-ID"
 	}
-
-	instance = &Limiter{
-		rules:        rules,
-		cache:        newEntryCache(maxCacheEntries),
-		trustedProxy: trustedProxy,
-		userHeader:   userHeader,
-	}
-	return instance, nil
-}
-
-// Instance returns the application-wide limiter created by Init.
-func Instance() *Limiter {
-	if instance == nil {
-		panic("ratelimit: Init must be called before Instance")
-	}
-	return instance
+	return cfg.RateLimitCacheMax, cfg.TrustedProxy, userHeader
 }
 
 func compileRules(doc model.RulesDocument) ([]compiledRule, error) {
@@ -96,18 +103,6 @@ func compileRules(doc model.RulesDocument) ([]compiledRule, error) {
 	})
 
 	return compiled, nil
-}
-
-func (l *Limiter) Update(doc model.RulesDocument) error {
-	rules, err := compileRules(doc)
-	if err != nil {
-		return err
-	}
-
-	l.mu.Lock()
-	l.rules = rules
-	l.mu.Unlock()
-	return nil
 }
 
 // Allow applies leaky-bucket rate limiting via go.uber.org/ratelimit.

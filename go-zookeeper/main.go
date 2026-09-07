@@ -29,21 +29,19 @@ func main() {
 	defer stop()
 
 	doc, zkClient, loader := loadRules(ctx, cfg)
+	if err := ratelimit.Instance().Update(doc); err != nil {
+		slog.Error("rate limit rules invalid", "err", err)
+		os.Exit(1)
+	}
+
 	if zkClient != nil {
 		defer zkClient.Close()
 	}
 
-	if _, err := ratelimit.Init(doc, cfg.RateLimitCacheMax, cfg.TrustedProxy, cfg.RateLimitUserHeader); err != nil {
-		slog.Error("rate limiter init failed", "err", err)
-		os.Exit(1)
-	}
-
 	if loader != nil {
 		go func() {
-			if err := loader.Watch(ctx, func(updated model.RulesDocument) {
-				if err := ratelimit.Instance().Update(updated); err != nil {
-					slog.Error("apply updated rules failed", "err", err)
-				}
+			if err := loader.Watch(ctx, func(updated model.RulesDocument) error {
+				return ratelimit.Instance().Update(updated)
 			}); err != nil && err != context.Canceled {
 				slog.Warn("zookeeper watch stopped", "err", err)
 			}
