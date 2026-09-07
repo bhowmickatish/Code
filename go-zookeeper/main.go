@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,13 +14,14 @@ import (
 	"github.com/atish/go-zookeeper/internal/handler"
 	"github.com/atish/go-zookeeper/internal/model"
 	"github.com/atish/go-zookeeper/internal/ratelimit"
+	"github.com/atish/go-zookeeper/internal/reloadstatus"
 	"github.com/atish/go-zookeeper/internal/zk"
 )
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 
-	cfg, err := config.Load()
+	cfg, err := config.Instance()
 	if err != nil {
 		slog.Error("config load failed", "err", err)
 		os.Exit(1)
@@ -32,6 +34,10 @@ func main() {
 	if err := ratelimit.Instance().Update(doc); err != nil {
 		slog.Error("rate limit rules invalid", "err", err)
 		os.Exit(1)
+	}
+	reloadstatus.RecordRulesApply("startup", nil)
+	if loader == nil {
+		reloadstatus.RecordZK("startup", fmt.Errorf("zookeeper unavailable"))
 	}
 
 	if zkClient != nil {

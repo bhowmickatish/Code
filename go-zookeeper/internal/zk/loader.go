@@ -10,6 +10,7 @@ import (
 	gzk "github.com/go-zookeeper/zk"
 
 	"github.com/atish/go-zookeeper/internal/model"
+	"github.com/atish/go-zookeeper/internal/reloadstatus"
 )
 
 type Loader struct {
@@ -44,19 +45,23 @@ func (l *Loader) LoadOnStartup(ctx context.Context, bootstrap bool) (model.Rules
 
 	doc, err := l.load()
 	if err != nil {
+		reloadstatus.RecordZK("zookeeper", err)
 		slog.Warn("zookeeper load failed, using fallback file", "file", l.seedFile, "err", err)
 		return LoadRulesFromFile(l.seedFile)
 	}
 
+	reloadstatus.RecordZK("zookeeper", nil)
 	logRules(doc, l.rulesPath)
 	return doc, nil
 }
 
 type ReloadFunc func(model.RulesDocument) error
 
-func applyReload(onReload ReloadFunc, doc model.RulesDocument) {
-	if err := onReload(doc); err != nil {
-		slog.Error("apply rate limit rules failed", "err", err)
+func applyReload(onReload ReloadFunc, doc model.RulesDocument, source string) {
+	err := onReload(doc)
+	reloadstatus.RecordRulesApply(source, err)
+	if err != nil {
+		slog.Error("apply rate limit rules failed", "source", source, "err", err)
 	}
 }
 
@@ -68,6 +73,8 @@ func (l *Loader) Watch(ctx context.Context, onReload ReloadFunc) error {
 
 		ch, err := l.client.Watch(l.rulesPath)
 		if err != nil {
+			reloadErr := fmt.Errorf("register watch on %q: %w", l.rulesPath, err)
+			reloadstatus.RecordZK("zookeeper-watch", reloadErr)
 			slog.Warn("zookeeper watch registration failed, applying fallback rules", "err", err)
 			l.applyFallback(onReload)
 			if !sleepOrDone(ctx, 2*time.Second) {
@@ -105,6 +112,7 @@ func (l *Loader) handleSessionEvent(event gzk.Event, onReload ReloadFunc) bool {
 
 	switch event.State {
 	case gzk.StateExpired:
+		reloadstatus.RecordZK("zookeeper-session", fmt.Errorf("session expired"))
 		slog.Warn("zookeeper session expired, applying fallback rules", "file", l.seedFile)
 		l.applyFallback(onReload)
 		return true
@@ -135,20 +143,23 @@ func (l *Loader) handleNodeEvent(event gzk.Event, onReload ReloadFunc) bool {
 func (l *Loader) reloadFromZK(onReload ReloadFunc) {
 	doc, err := l.load()
 	if err != nil {
+		reloadstatus.RecordZK("zookeeper", err)
 		slog.Warn("reload rules from zookeeper failed, keeping current rules", "err", err)
 		return
 	}
+	reloadstatus.RecordZK("zookeeper", nil)
 	slog.Info("reloaded rate limit rules from zookeeper", "count", len(doc.Rules), "version", doc.Version)
-	applyReload(onReload, doc)
+	applyReload(onReload, doc, "zookeeper")
 }
 
 func (l *Loader) applyFallback(onReload ReloadFunc) {
 	doc, err := LoadRulesFromFile(l.seedFile)
 	if err != nil {
+		reloadstatus.RecordRulesApply("fallback", err)
 		slog.Error("fallback rules file unavailable", "file", l.seedFile, "err", err)
 		return
 	}
-	applyReload(onReload, doc)
+	applyReload(onReload, doc, "fallback")
 }
 
 func sleepOrDone(ctx context.Context, d time.Duration) bool {
@@ -189,6 +200,10 @@ func (l *Loader) bootstrapIfMissing() error {
 }
 
 func (l *Loader) load() (model.RulesDocument, error) {
+	if testLoadHook != nil {
+		return testLoadHook(l)
+	}
+
 	data, err := l.client.Get(l.rulesPath)
 	if err != nil {
 		return model.RulesDocument{}, err

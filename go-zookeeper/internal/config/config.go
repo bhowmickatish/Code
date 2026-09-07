@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -24,7 +25,21 @@ type Config struct {
 	ZKDigest            string
 }
 
-func Load() (Config, error) {
+var (
+	instance Config
+	loadErr  error
+	loadOnce sync.Once
+)
+
+// Instance returns the application config singleton, loaded from the environment on first call.
+func Instance() (Config, error) {
+	loadOnce.Do(func() {
+		instance, loadErr = loadFromEnv()
+	})
+	return instance, loadErr
+}
+
+func loadFromEnv() (Config, error) {
 	sessionTimeout, err := envDuration("ZK_SESSION_TIMEOUT", 10*time.Second)
 	if err != nil {
 		return Config{}, err

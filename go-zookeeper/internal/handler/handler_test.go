@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/atish/go-zookeeper/internal/model"
 	"github.com/atish/go-zookeeper/internal/ratelimit"
+	"github.com/atish/go-zookeeper/internal/reloadstatus"
 )
 
 func TestRateLimitMiddlewareThrottles(t *testing.T) {
@@ -49,7 +51,59 @@ func TestRateLimitMiddlewareThrottles(t *testing.T) {
 	_ = instance
 }
 
+func TestRateLimitMiddlewareRejectsUnmatchedPath(t *testing.T) {
+	doc := model.RulesDocument{
+		Version: 1,
+		Rules: []model.RateLimit{
+			{Name: "users", PathPrefix: "/api/users", Limit: 10, Window: "1s", Key: model.KeyStrategyIP},
+		},
+	}
+	ratelimit.ResetForTest(t, doc)
+
+	handler := RateLimitMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/orders", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unmatched path, got %d", rec.Code)
+	}
+}
+
+func TestHealthReturns503WhenRulesApplyFailed(t *testing.T) {
+	reloadstatus.ResetForTest()
+	reloadstatus.RecordRulesApply("zookeeper", fmt.Errorf("invalid rules"))
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	health(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+}
+
+func TestHealthReturns200WhenZKFailedButRulesApplied(t *testing.T) {
+	reloadstatus.ResetForTest()
+	reloadstatus.RecordZK("zookeeper-watch", fmt.Errorf("watch registration failed"))
+	reloadstatus.RecordRulesApply("fallback", nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	health(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+}
+
 func TestHealthBypassesRateLimitMiddleware(t *testing.T) {
+	reloadstatus.ResetForTest()
+	reloadstatus.RecordRulesApply("startup", nil)
+
 	doc := model.RulesDocument{
 		Version: 1,
 		Rules: []model.RateLimit{

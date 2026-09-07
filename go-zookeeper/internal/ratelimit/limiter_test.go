@@ -52,6 +52,91 @@ func TestMatchRuleLongestPrefixWins(t *testing.T) {
 	}
 }
 
+func TestAllowFailsClosedWhenNoRuleMatches(t *testing.T) {
+	l := &Limiter{cache: newEntryCache(defaultCacheMax)}
+	doc := model.RulesDocument{
+		Version: 1,
+		Rules: []model.RateLimit{
+			{Name: "users", PathPrefix: "/api/users", Limit: 10, Window: "1s", Key: model.KeyStrategyIP},
+		},
+	}
+	if err := l.Update(doc); err != nil {
+		t.Fatalf("update rules: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/orders", nil)
+	if _, allowed := l.Allow(req); allowed {
+		t.Fatal("expected unmatched path to fail closed")
+	}
+}
+
+func TestAllowFailsClosedWithNoRulesLoaded(t *testing.T) {
+	l := &Limiter{cache: newEntryCache(defaultCacheMax)}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	if _, allowed := l.Allow(req); allowed {
+		t.Fatal("expected request to fail closed when no rules are loaded")
+	}
+}
+
+func TestUpdateRejectsInvalidRulesDocument(t *testing.T) {
+	l := &Limiter{cache: newEntryCache(defaultCacheMax)}
+	valid := model.RulesDocument{
+		Version: 1,
+		Rules: []model.RateLimit{
+			{Name: "users", PathPrefix: "/api/users", Limit: 10, Window: "1s", Key: model.KeyStrategyIP},
+		},
+	}
+	if err := l.Update(valid); err != nil {
+		t.Fatalf("update valid rules: %v", err)
+	}
+
+	invalid := model.RulesDocument{
+		Version: 1,
+		Rules: []model.RateLimit{
+			{Name: "bad", PathPrefix: "/api/users", Limit: 0, Window: "1s", Key: model.KeyStrategyIP},
+		},
+	}
+	if err := l.Update(invalid); err == nil {
+		t.Fatal("expected invalid limit to fail validation")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	ruleName, allowed := l.Allow(req)
+	if !allowed || ruleName != "users" {
+		t.Fatalf("expected previous rules to remain active, got rule=%q allowed=%v", ruleName, allowed)
+	}
+}
+
+func TestUpdateKeepsRulesOnInvalidDocument(t *testing.T) {
+	l := &Limiter{cache: newEntryCache(defaultCacheMax)}
+	valid := model.RulesDocument{
+		Version: 1,
+		Rules: []model.RateLimit{
+			{Name: "users", PathPrefix: "/api/users", Limit: 10, Window: "1s", Key: model.KeyStrategyIP},
+		},
+	}
+	if err := l.Update(valid); err != nil {
+		t.Fatalf("update valid rules: %v", err)
+	}
+
+	invalid := model.RulesDocument{
+		Version: 1,
+		Rules: []model.RateLimit{
+			{Name: "bad", PathPrefix: "/api/users", Limit: 10, Window: "not-a-duration", Key: model.KeyStrategyIP},
+		},
+	}
+	if err := l.Update(invalid); err == nil {
+		t.Fatal("expected invalid rules to fail")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	ruleName, allowed := l.Allow(req)
+	if !allowed || ruleName != "users" {
+		t.Fatalf("expected previous rules to remain active, got rule=%q allowed=%v", ruleName, allowed)
+	}
+}
+
 func TestCompileRulesTieBreaksByName(t *testing.T) {
 	doc := model.RulesDocument{
 		Version: 1,

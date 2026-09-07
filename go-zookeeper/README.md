@@ -36,7 +36,7 @@ go run .
 ```
 
 ```bash
-curl http://localhost:8080/health          # never rate-limited
+curl http://localhost:8080/health          # readiness: 503 only if rules apply failed; check zk_ok separately
 curl http://localhost:8080/api/users
 curl -H "X-User-ID: alice" http://localhost:8080/api/users   # per-user bucket (users rule)
 curl http://localhost:8080/api/orders                          # global bucket (orders-global rule)
@@ -58,6 +58,12 @@ curl http://localhost:8080/api/other                           # per-ip bucket (
 | `RATELIMIT_USER_HEADER` | `X-User-ID`        | Header for `key: "user"` rules                   |
 | `TRUSTED_PROXY`       | `false`              | Trust `X-Forwarded-For` for IP keys              |
 | `SERVER_ADDR`         | `:8080`              | HTTP listen address                              |
+
+## Health checks
+
+- **Readiness:** `GET /health` — pass on HTTP 200 (`rules_ok: true`).
+- **Liveness:** keep passing while the process responds; do not fail on `zk_ok: false` when fallback rules are active.
+- **Alerts:** monitor `zk_ok` in the JSON body for ZooKeeper dependency health.
 
 ## Update rules live
 

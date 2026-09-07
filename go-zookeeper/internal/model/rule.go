@@ -46,23 +46,32 @@ func ParseRulesDocument(data []byte) (RulesDocument, error) {
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return RulesDocument{}, fmt.Errorf("parse rules json: %w", err)
 	}
+	if err := ValidateRulesDocument(doc); err != nil {
+		return RulesDocument{}, err
+	}
+	return doc, nil
+}
+
+// ValidateRulesDocument checks a parsed rules document.
+func ValidateRulesDocument(doc RulesDocument) error {
 	if doc.Version == 0 {
-		return RulesDocument{}, fmt.Errorf("rules version is required")
+		return fmt.Errorf("rules version is required")
 	}
 	if len(doc.Rules) == 0 {
-		return RulesDocument{}, fmt.Errorf("rules list is empty")
+		return fmt.Errorf("rules list is empty")
 	}
+
 	names := make(map[string]struct{}, len(doc.Rules))
 	for i, rule := range doc.Rules {
 		if err := validateRule(rule); err != nil {
-			return RulesDocument{}, fmt.Errorf("rules[%d]: %w", i, err)
+			return fmt.Errorf("rules[%d]: %w", i, err)
 		}
 		if _, exists := names[rule.Name]; exists {
-			return RulesDocument{}, fmt.Errorf("rules[%d]: duplicate rule name %q", i, rule.Name)
+			return fmt.Errorf("rules[%d]: duplicate rule name %q", i, rule.Name)
 		}
 		names[rule.Name] = struct{}{}
 	}
-	return doc, nil
+	return nil
 }
 
 func validateRule(rule RateLimit) error {

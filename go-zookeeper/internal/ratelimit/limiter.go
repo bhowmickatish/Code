@@ -13,17 +13,15 @@ import (
 )
 
 var (
-	instance   *Limiter
-	instanceMu sync.RWMutex
-	initOnce   sync.Once
+	instance *Limiter
+	initOnce sync.Once
 )
 
 type Limiter struct {
-	mu           sync.RWMutex
-	rules        []compiledRule
-	cache        *entryCache
-	trustedProxy bool
-	userHeader   string
+	mu    sync.RWMutex
+	rules []compiledRule
+	cache *entryCache
+	cfg   config.Config
 }
 
 type compiledRule struct {
@@ -37,18 +35,20 @@ type compiledRule struct {
 // Instance returns the application-wide limiter singleton.
 func Instance() *Limiter {
 	initOnce.Do(func() {
-		maxCache, trustedProxy, userHeader := loadSettings()
-		instanceMu.Lock()
-		instance = &Limiter{
-			cache:        newEntryCache(maxCache),
-			trustedProxy: trustedProxy,
-			userHeader:   userHeader,
+		cfg, err := config.Instance()
+		if err != nil {
+			cfg = config.Config{
+				RateLimitCacheMax:   defaultCacheMax,
+				RateLimitUserHeader: "X-User-ID",
+			}
 		}
-		instanceMu.Unlock()
+
+		instance = &Limiter{
+			cache: newEntryCache(cfg.RateLimitCacheMax),
+			cfg:   cfg,
+		}
 	})
 
-	instanceMu.RLock()
-	defer instanceMu.RUnlock()
 	return instance
 }
 
@@ -65,20 +65,11 @@ func (l *Limiter) Update(doc model.RulesDocument) error {
 	return nil
 }
 
-func loadSettings() (maxCache int, trustedProxy bool, userHeader string) {
-	cfg, err := config.Load()
-	if err != nil {
-		return defaultCacheMax, false, "X-User-ID"
-	}
-
-	userHeader = cfg.RateLimitUserHeader
-	if userHeader == "" {
-		userHeader = "X-User-ID"
-	}
-	return cfg.RateLimitCacheMax, cfg.TrustedProxy, userHeader
-}
-
 func compileRules(doc model.RulesDocument) ([]compiledRule, error) {
+	if err := model.ValidateRulesDocument(doc); err != nil {
+		return nil, err
+	}
+
 	compiled := make([]compiledRule, 0, len(doc.Rules))
 	for _, rule := range doc.Rules {
 		window, err := rule.WindowDuration()
@@ -107,22 +98,22 @@ func compileRules(doc model.RulesDocument) ([]compiledRule, error) {
 
 // Allow applies leaky-bucket rate limiting via go.uber.org/ratelimit.
 // Over-limit requests block until a slot is available (Take semantics).
-func (l *Limiter) Allow(r *http.Request) string {
+// Returns the matched rule name and whether the request is allowed.
+// Unmatched paths fail closed (allowed == false).
+func (l *Limiter) Allow(r *http.Request) (ruleName string, allowed bool) {
 	l.mu.RLock()
 	rules := l.rules
-	trustedProxy := l.trustedProxy
-	userHeader := l.userHeader
 	l.mu.RUnlock()
 
 	rule, ok := matchRule(rules, r.URL.Path)
 	if !ok {
-		return ""
+		return "", false
 	}
 
-	key := limiterKey(rule.key, r, trustedProxy, userHeader)
+	key := limiterKey(rule.key, r, l.cfg.TrustedProxy, l.cfg.RateLimitUserHeader)
 	entry := l.cache.get(rule.name+":"+key, rule.limit, rule.window)
 	entry.take()
-	return rule.name
+	return rule.name, true
 }
 
 func matchRule(rules []compiledRule, path string) (compiledRule, bool) {

@@ -11,7 +11,9 @@ func RateLimitHandler() http.Handler {
 	limited := http.NewServeMux()
 	registerUserRoutes(limited)
 	registerOrderRoutes(limited)
-	mux.Handle("/api/", RateLimitMiddleware()(limited))
+	limitedHandler := RateLimitMiddleware()(limited)
+	mux.Handle("/api", limitedHandler)
+	mux.Handle("/api/", limitedHandler)
 
 	return mux
 }
