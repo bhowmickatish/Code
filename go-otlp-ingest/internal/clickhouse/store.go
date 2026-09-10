@@ -147,20 +147,39 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) Insert(ctx context.Context, batch mapper.Batch) error {
-	if err := insertGauges(ctx, s.conn, batch.Gauges); err != nil {
-		return err
+func (s *Store) Insert(ctx context.Context, batch mapper.Batch) (mapper.Batch, error) {
+	remaining := batch
+
+	if len(remaining.Gauges) > 0 {
+		if err := insertGauges(ctx, s.conn, remaining.Gauges); err != nil {
+			return remaining, fmt.Errorf("gauge: %w", err)
+		}
+		remaining.Gauges = nil
 	}
-	if err := insertSums(ctx, s.conn, batch.Sums); err != nil {
-		return err
+	if len(remaining.Sums) > 0 {
+		if err := insertSums(ctx, s.conn, remaining.Sums); err != nil {
+			return remaining, fmt.Errorf("sum: %w", err)
+		}
+		remaining.Sums = nil
 	}
-	if err := insertHistograms(ctx, s.conn, batch.Histograms); err != nil {
-		return err
+	if len(remaining.Histograms) > 0 {
+		if err := insertHistograms(ctx, s.conn, remaining.Histograms); err != nil {
+			return remaining, fmt.Errorf("histogram: %w", err)
+		}
+		remaining.Histograms = nil
 	}
-	if err := insertExpHistograms(ctx, s.conn, batch.ExpHistograms); err != nil {
-		return err
+	if len(remaining.ExpHistograms) > 0 {
+		if err := insertExpHistograms(ctx, s.conn, remaining.ExpHistograms); err != nil {
+			return remaining, fmt.Errorf("exp_histogram: %w", err)
+		}
+		remaining.ExpHistograms = nil
 	}
-	return insertSummaries(ctx, s.conn, batch.Summaries)
+	if len(remaining.Summaries) > 0 {
+		if err := insertSummaries(ctx, s.conn, remaining.Summaries); err != nil {
+			return remaining, fmt.Errorf("summary: %w", err)
+		}
+	}
+	return mapper.Batch{}, nil
 }
 
 func insertGauges(ctx context.Context, conn driver.Conn, rows []mapper.GaugeRow) error {

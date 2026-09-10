@@ -20,9 +20,9 @@ type sink struct {
 	n int
 }
 
-func (s *sink) Insert(ctx context.Context, batch mapper.Batch) error {
+func (s *sink) Insert(ctx context.Context, batch mapper.Batch) (mapper.Batch, error) {
 	s.n += batch.Len()
-	return nil
+	return mapper.Batch{}, nil
 }
 
 func TestExportEmpty(t *testing.T) {
@@ -31,6 +31,18 @@ func TestExportEmpty(t *testing.T) {
 	srv := New(b, 100, mapper.Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
 	_, err := srv.Export(context.Background(), &colmetricspb.ExportMetricsServiceRequest{})
 	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code=%v err=%v", status.Code(err), err)
+	}
+}
+
+func TestExportCanceledContext(t *testing.T) {
+	b := batcher.New(&sink{}, 10, 100, time.Hour, nil)
+	t.Cleanup(func() { closeBatcher(t, b) })
+	srv := New(b, 100, mapper.Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := srv.Export(ctx, gaugeReq())
+	if status.Code(err) != codes.Canceled {
 		t.Fatalf("code=%v err=%v", status.Code(err), err)
 	}
 }

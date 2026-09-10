@@ -3,6 +3,7 @@ package batcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -17,7 +18,7 @@ var (
 )
 
 type Writer interface {
-	Insert(ctx context.Context, batch mapper.Batch) error
+	Insert(ctx context.Context, batch mapper.Batch) (remaining mapper.Batch, err error)
 }
 
 type Batcher struct {
@@ -32,6 +33,7 @@ type Batcher struct {
 	pendingN   int
 	shutdown   bool
 	insertFail bool
+	flushErr   error
 
 	wake   chan struct{}
 	done   chan struct{}
@@ -99,16 +101,21 @@ func (b *Batcher) Close(ctx context.Context) error {
 
 	select {
 	case <-b.closed:
-		return nil
+		b.mu.Lock()
+		err := b.flushErr
+		b.mu.Unlock()
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (b *Batcher) Unhealthy() bool {
+// IngestReady reports whether new Export RPCs should be accepted.
+// False when ClickHouse inserts are failing or the batcher is shutting down.
+func (b *Batcher) IngestReady() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.insertFail || b.shutdown
+	return !b.insertFail && !b.shutdown
 }
 
 func (b *Batcher) loop() {
@@ -146,7 +153,7 @@ func (b *Batcher) flushOnce(ctx context.Context) {
 	if n == 0 {
 		return
 	}
-	b.send(ctx, batch, n)
+	b.send(ctx, batch, n, false)
 }
 
 func (b *Batcher) flushUntilEmpty(ctx context.Context) {
@@ -155,33 +162,47 @@ func (b *Batcher) flushUntilEmpty(ctx context.Context) {
 		if n == 0 {
 			return
 		}
-		b.send(ctx, batch, n)
+		b.send(ctx, batch, n, true)
 	}
 }
 
-func (b *Batcher) send(ctx context.Context, batch mapper.Batch, n int) {
+func (b *Batcher) send(ctx context.Context, batch mapper.Batch, n int, onShutdown bool) {
+	remaining := batch
 	backoff := 100 * time.Millisecond
-	for {
-		err := b.writer.Insert(ctx, batch)
+	deadline := time.Time{}
+	if onShutdown {
+		deadline = time.Now().Add(10 * time.Second)
+	}
+
+	for remaining.Len() > 0 {
+		var err error
+		remaining, err = b.writer.Insert(ctx, remaining)
 		if err == nil {
-			b.mu.Lock()
-			b.insertFail = false
-			b.mu.Unlock()
+			b.setInsertFail(false)
 			return
 		}
-		b.mu.Lock()
-		b.insertFail = true
-		shut := b.shutdown
-		b.mu.Unlock()
-		b.log.Error("clickhouse insert failed", "err", err, "rows", n)
-		if shut {
-			return
+
+		b.setInsertFail(true)
+		b.log.Error("clickhouse insert failed",
+			"err", err,
+			"rows", remaining.Len(),
+			"shutdown", onShutdown,
+		)
+
+		if onShutdown {
+			if time.Now().After(deadline) {
+				b.recordFlushDrop(remaining.Len(), err)
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
+
 		timer := time.NewTimer(backoff)
 		select {
 		case <-b.done:
 			timer.Stop()
-			_ = b.writer.Insert(context.Background(), batch)
+			b.send(context.Background(), remaining, remaining.Len(), true)
 			return
 		case <-timer.C:
 		}
@@ -189,6 +210,22 @@ func (b *Batcher) send(ctx context.Context, batch mapper.Batch, n int) {
 			backoff *= 2
 		}
 	}
+}
+
+func (b *Batcher) setInsertFail(failed bool) {
+	b.mu.Lock()
+	b.insertFail = failed
+	b.mu.Unlock()
+}
+
+func (b *Batcher) recordFlushDrop(rows int, err error) {
+	b.mu.Lock()
+	b.insertFail = true
+	if b.flushErr == nil {
+		b.flushErr = fmt.Errorf("shutdown flush dropped %d rows: %w", rows, err)
+	}
+	b.mu.Unlock()
+	b.log.Error("shutdown flush dropped rows", "rows", rows, "err", err)
 }
 
 func (b *Batcher) signal() {

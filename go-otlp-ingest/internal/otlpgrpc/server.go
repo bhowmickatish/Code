@@ -26,7 +26,10 @@ func New(b *batcher.Batcher, maxPoints int, limits mapper.Limits) *Server {
 }
 
 func (s *Server) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
-	_ = ctx
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContext(err)
+	}
+
 	n := mapper.CountDataPoints(req)
 	if n == 0 {
 		return nil, status.Error(codes.InvalidArgument, "empty export request")
@@ -36,6 +39,10 @@ func (s *Server) Export(ctx context.Context, req *colmetricspb.ExportMetricsServ
 	}
 
 	res := mapper.Map(req, time.Now().UTC(), s.limits)
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContext(err)
+	}
+
 	if err := s.batcher.Enqueue(res.Batch); err != nil {
 		switch {
 		case errors.Is(err, batcher.ErrBackpressure):
@@ -55,4 +62,14 @@ func (s *Server) Export(ctx context.Context, req *colmetricspb.ExportMetricsServ
 		}
 	}
 	return out, nil
+}
+
+func statusFromContext(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return status.Error(codes.Canceled, err.Error())
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	}
+	return status.Error(codes.Internal, err.Error())
 }

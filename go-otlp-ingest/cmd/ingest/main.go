@@ -59,7 +59,7 @@ func main() {
 	}))
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(gs, hs)
-	setHealth(hs, store)
+	setHealth(hs, store, b)
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -69,14 +69,14 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				setHealth(hs, store)
+				setHealth(hs, store, b)
 			}
 		}
 	}()
 
 	httpSrv := &http.Server{
 		Addr:         cfg.HealthAddr,
-		Handler:      healthHandler(store),
+		Handler:      healthHandler(store, b),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
@@ -118,29 +118,34 @@ func main() {
 	}
 }
 
-func setHealth(hs *health.Server, store *clickhouse.Store) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := store.Ping(ctx); err != nil {
+func setHealth(hs *health.Server, store *clickhouse.Store, b *batcher.Batcher) {
+	if !ingestReady(store, b) {
 		hs.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 		return
 	}
 	hs.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 }
 
-func healthHandler(store *clickhouse.Store) http.Handler {
+func healthHandler(store *clickhouse.Store, b *batcher.Batcher) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
 			http.NotFound(w, r)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if err := store.Ping(ctx); err != nil {
-			http.Error(w, "clickhouse unavailable", http.StatusServiceUnavailable)
+		if !ingestReady(store, b) {
+			http.Error(w, "ingest unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+}
+
+func ingestReady(store *clickhouse.Store, b *batcher.Batcher) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := store.Ping(ctx); err != nil {
+		return false
+	}
+	return b.IngestReady()
 }

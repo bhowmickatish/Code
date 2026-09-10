@@ -355,8 +355,13 @@ Env-based singleton, same idea as `go-zookeeper/internal/config`.
 
 **Health**
 
-- gRPC health: `SERVING` when CH ping succeeds.
-- HTTP `/health`: 200 if CH ping succeeds, 503 otherwise.
+- gRPC health and HTTP `/health`: `SERVING` / 200 when ClickHouse ping succeeds **and** the batcher is accepting writes (`IngestReady`, not blocked by insert failures).
+- `NOT_SERVING` / 503 when ClickHouse is down or recent inserts are failing.
+
+**Shutdown flush**
+
+- Pending rows are retried for up to 10s during shutdown.
+- If rows still cannot be inserted, they are logged and `Close` returns an error (data was already ACKed to clients).
 
 ---
 
@@ -390,7 +395,9 @@ Local send path:
 
 ### 12.1 Duplicate data points
 
-Retries after a successful batcher handoff but failed (or unflushed) insert produce duplicates. MergeTree does not dedupe. Downstream queries should tolerate this (e.g. `argMax` / aggregations), or a later version can use `ReplacingMergeTree` with a stable identity.
+Retries after a successful batcher handoff but failed (or unflushed) insert produce duplicates. MergeTree does not dedupe. Partial multi-table failures within one flush retry only the tables not yet inserted, avoiding duplicate gauge rows when a later table fails.
+
+Downstream queries should tolerate duplicates (e.g. `argMax` / aggregations), or a later version can use `ReplacingMergeTree` with a stable identity.
 
 ### 12.2 Future: Kafka buffer
 
