@@ -1,0 +1,10 @@
+module gdoc-grid
+
+go 1.26.6
+
+require github.com/PuerkitoBio/goquery v1.12.0
+
+require (
+	github.com/andybalholm/cascadia v1.3.4 // indirect
+	golang.org/x/net v0.58.0 // indirect
+)
