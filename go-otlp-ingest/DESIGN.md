@@ -220,16 +220,16 @@ TimeUnix           DateTime64(9)
 **`otel_metrics_histogram`**
 
 - `Count UInt64`
-- `Sum Float64`
-- `Min Float64`
-- `Max Float64`
+- `Sum Nullable(Float64)`
+- `Min Nullable(Float64)`
+- `Max Nullable(Float64)`
 - `BucketCounts Array(UInt64)`
 - `ExplicitBounds Array(Float64)`
 
 **`otel_metrics_exp_histogram`**
 
 - `Count UInt64`
-- `Sum Float64`
+- `Sum Nullable(Float64)`
 - `Scale Int32`
 - `ZeroCount UInt64`
 - `PositiveOffset Int32`
@@ -277,13 +277,15 @@ Walk order: each `ResourceMetrics` → each `ScopeMetrics` → each `Metric` →
 | Rule | Behavior |
 | ---- | -------- |
 | Empty resource / scope / metric | Skip |
-| Metric with no data points | Skip |
+| Metric with no data points / nil inner payload | Reject via `partial_success` |
+| Nil data point in a metric | Reject that point via `partial_success` |
 | Number value | `AsDouble` if set, else `AsInt` → `float64` |
 | Missing `time_unix_nano` | Use server receive time (last resort; documented here) |
 | `service.name` missing | Empty string `ServiceName`; still store full resource map |
 | Attribute values | Stringify non-string `AnyValue` (bool, int, double, bytes, array, kvlist) so ClickHouse `Map(String, String)` stays uniform |
-| Oversize maps | Cap max keys and max value length; drop excess; count as rejected if the point becomes unusable |
+| Oversize maps | Cap max keys (sorted alphabetically) and max value length; drop excess keys |
 | Unknown metric type | Reject those points via `partial_success` |
+| Histogram sum/min/max | Stored as `Nullable(Float64)`; unset OTLP fields remain SQL `NULL` |
 
 Bytes attributes are **hex-encoded**. Nested array/kvlist values are JSON-encoded strings.
 

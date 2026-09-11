@@ -61,9 +61,9 @@ type SumRow struct {
 type HistogramRow struct {
 	Common
 	Count          uint64
-	Sum            float64
-	Min            float64
-	Max            float64
+	Sum            *float64
+	Min            *float64
+	Max            *float64
 	BucketCounts   []uint64
 	ExplicitBounds []float64
 }
@@ -71,7 +71,7 @@ type HistogramRow struct {
 type ExpHistogramRow struct {
 	Common
 	Count                uint64
-	Sum                  float64
+	Sum                  *float64
 	Scale                int32
 	ZeroCount            uint64
 	PositiveOffset       int32

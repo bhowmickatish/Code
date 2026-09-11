@@ -3,6 +3,7 @@ package mapper
 import (
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -43,27 +44,42 @@ func metricPointCount(m *metricspb.Metric) int {
 	switch d := m.Data.(type) {
 	case *metricspb.Metric_Gauge:
 		if d.Gauge == nil {
-			return 0
+			return 1
+		}
+		if len(d.Gauge.DataPoints) == 0 {
+			return 1
 		}
 		return len(d.Gauge.DataPoints)
 	case *metricspb.Metric_Sum:
 		if d.Sum == nil {
-			return 0
+			return 1
+		}
+		if len(d.Sum.DataPoints) == 0 {
+			return 1
 		}
 		return len(d.Sum.DataPoints)
 	case *metricspb.Metric_Histogram:
 		if d.Histogram == nil {
-			return 0
+			return 1
+		}
+		if len(d.Histogram.DataPoints) == 0 {
+			return 1
 		}
 		return len(d.Histogram.DataPoints)
 	case *metricspb.Metric_ExponentialHistogram:
 		if d.ExponentialHistogram == nil {
-			return 0
+			return 1
+		}
+		if len(d.ExponentialHistogram.DataPoints) == 0 {
+			return 1
 		}
 		return len(d.ExponentialHistogram.DataPoints)
 	case *metricspb.Metric_Summary:
 		if d.Summary == nil {
-			return 0
+			return 1
+		}
+		if len(d.Summary.DataPoints) == 0 {
+			return 1
 		}
 		return len(d.Summary.DataPoints)
 	default:
@@ -131,7 +147,7 @@ func mapMetric(
 			MetricName:         m.Name,
 			MetricDescription:  m.Description,
 			MetricUnit:         m.Unit,
-			ResourceAttributes: resAttrs,
+			ResourceAttributes: cloneMap(resAttrs),
 			ScopeName:          scopeName,
 			ScopeVersion:       scopeVersion,
 			Attributes:         attrMap(attrs, lim),
@@ -141,10 +157,16 @@ func mapMetric(
 	switch d := m.Data.(type) {
 	case *metricspb.Metric_Gauge:
 		if d.Gauge == nil {
+			rejectPoints(out, reasons, m.Name, "empty gauge payload", 1)
+			return
+		}
+		if len(d.Gauge.DataPoints) == 0 {
+			rejectPoints(out, reasons, m.Name, "no gauge data points", 1)
 			return
 		}
 		for _, p := range d.Gauge.DataPoints {
 			if p == nil {
+				rejectPoints(out, reasons, m.Name, "nil gauge data point", 1)
 				continue
 			}
 			out.Batch.Gauges = append(out.Batch.Gauges, GaugeRow{
@@ -154,10 +176,16 @@ func mapMetric(
 		}
 	case *metricspb.Metric_Sum:
 		if d.Sum == nil {
+			rejectPoints(out, reasons, m.Name, "empty sum payload", 1)
+			return
+		}
+		if len(d.Sum.DataPoints) == 0 {
+			rejectPoints(out, reasons, m.Name, "no sum data points", 1)
 			return
 		}
 		for _, p := range d.Sum.DataPoints {
 			if p == nil {
+				rejectPoints(out, reasons, m.Name, "nil sum data point", 1)
 				continue
 			}
 			out.Batch.Sums = append(out.Batch.Sums, SumRow{
@@ -169,34 +197,46 @@ func mapMetric(
 		}
 	case *metricspb.Metric_Histogram:
 		if d.Histogram == nil {
+			rejectPoints(out, reasons, m.Name, "empty histogram payload", 1)
+			return
+		}
+		if len(d.Histogram.DataPoints) == 0 {
+			rejectPoints(out, reasons, m.Name, "no histogram data points", 1)
 			return
 		}
 		for _, p := range d.Histogram.DataPoints {
 			if p == nil {
+				rejectPoints(out, reasons, m.Name, "nil histogram data point", 1)
 				continue
 			}
 			out.Batch.Histograms = append(out.Batch.Histograms, HistogramRow{
 				Common:         base(p.Attributes, p.StartTimeUnixNano, p.TimeUnixNano),
 				Count:          p.Count,
-				Sum:            derefF64(p.Sum),
-				Min:            derefF64(p.Min),
-				Max:            derefF64(p.Max),
+				Sum:            cloneF64(p.Sum),
+				Min:            cloneF64(p.Min),
+				Max:            cloneF64(p.Max),
 				BucketCounts:   p.BucketCounts,
 				ExplicitBounds: p.ExplicitBounds,
 			})
 		}
 	case *metricspb.Metric_ExponentialHistogram:
 		if d.ExponentialHistogram == nil {
+			rejectPoints(out, reasons, m.Name, "empty exponential histogram payload", 1)
+			return
+		}
+		if len(d.ExponentialHistogram.DataPoints) == 0 {
+			rejectPoints(out, reasons, m.Name, "no exponential histogram data points", 1)
 			return
 		}
 		for _, p := range d.ExponentialHistogram.DataPoints {
 			if p == nil {
+				rejectPoints(out, reasons, m.Name, "nil exponential histogram data point", 1)
 				continue
 			}
 			row := ExpHistogramRow{
 				Common:    base(p.Attributes, p.StartTimeUnixNano, p.TimeUnixNano),
 				Count:     p.Count,
-				Sum:       derefF64(p.Sum),
+				Sum:       cloneF64(p.Sum),
 				Scale:     p.Scale,
 				ZeroCount: p.ZeroCount,
 			}
@@ -212,10 +252,16 @@ func mapMetric(
 		}
 	case *metricspb.Metric_Summary:
 		if d.Summary == nil {
+			rejectPoints(out, reasons, m.Name, "empty summary payload", 1)
+			return
+		}
+		if len(d.Summary.DataPoints) == 0 {
+			rejectPoints(out, reasons, m.Name, "no summary data points", 1)
 			return
 		}
 		for _, p := range d.Summary.DataPoints {
 			if p == nil {
+				rejectPoints(out, reasons, m.Name, "nil summary data point", 1)
 				continue
 			}
 			qs := make([]float64, 0, len(p.QuantileValues))
@@ -236,13 +282,20 @@ func mapMetric(
 			})
 		}
 	default:
-		n := metricPointCount(m)
+		n := int64(metricPointCount(m))
 		if n < 1 {
 			n = 1
 		}
-		out.Rejected += int64(n)
-		*reasons = append(*reasons, "unknown metric type for "+m.Name)
+		rejectPoints(out, reasons, m.Name, "unknown metric type", n)
 	}
+}
+
+func rejectPoints(out *Result, reasons *[]string, metricName, reason string, n int64) {
+	if n < 1 {
+		n = 1
+	}
+	out.Rejected += n
+	*reasons = append(*reasons, reason+" for "+metricName)
 }
 
 func resourceAttrs(res *resourcepb.Resource, lim Limits) (map[string]string, string) {
@@ -254,17 +307,50 @@ func resourceAttrs(res *resourcepb.Resource, lim Limits) (map[string]string, str
 }
 
 func attrMap(kvs []*commonpb.KeyValue, lim Limits) map[string]string {
-	out := make(map[string]string, min(len(kvs), lim.MaxAttrKeys))
+	type pair struct {
+		key string
+		val string
+	}
+	pairs := make([]pair, 0, len(kvs))
 	for _, kv := range kvs {
 		if kv == nil || kv.Key == "" {
 			continue
 		}
-		if len(out) >= lim.MaxAttrKeys {
-			break
-		}
-		out[kv.Key] = truncate(anyValueString(kv.Value), lim.MaxAttrValue)
+		pairs = append(pairs, pair{
+			key: kv.Key,
+			val: truncate(anyValueString(kv.Value), lim.MaxAttrValue),
+		})
+	}
+	slices.SortFunc(pairs, func(a, b pair) int {
+		return strings.Compare(a.key, b.key)
+	})
+	if len(pairs) > lim.MaxAttrKeys {
+		pairs = pairs[:lim.MaxAttrKeys]
+	}
+	out := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		out[p.key] = p.val
 	}
 	return out
+}
+
+func cloneMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneF64(p *float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
 
 func anyValueString(v *commonpb.AnyValue) string {
@@ -376,13 +462,6 @@ func timestamp(unixNano uint64, fallback time.Time) time.Time {
 		return fallback
 	}
 	return time.Unix(0, int64(unixNano)).UTC()
-}
-
-func derefF64(p *float64) float64 {
-	if p == nil {
-		return 0
-	}
-	return *p
 }
 
 func truncate(s string, max int) string {

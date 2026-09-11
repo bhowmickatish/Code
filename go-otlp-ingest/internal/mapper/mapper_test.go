@@ -125,6 +125,139 @@ func TestAttrCapsAndBytesHex(t *testing.T) {
 	}
 }
 
+func TestEmptyGaugePayloadRejected(t *testing.T) {
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "broken",
+					Data: &metricspb.Metric_Gauge{},
+				}},
+			}},
+		}},
+	}
+	got := Map(req, time.Now().UTC(), Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
+	if got.Rejected != 1 {
+		t.Fatalf("rejected=%d", got.Rejected)
+	}
+	if got.Batch.Len() != 0 {
+		t.Fatalf("batch=%d", got.Batch.Len())
+	}
+}
+
+func TestNilGaugeDataPointRejected(t *testing.T) {
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "mixed",
+					Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+						DataPoints: []*metricspb.NumberDataPoint{
+							nil,
+							{Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 2}},
+						},
+					}},
+				}},
+			}},
+		}},
+	}
+	got := Map(req, time.Now().UTC(), Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
+	if got.Rejected != 1 {
+		t.Fatalf("rejected=%d", got.Rejected)
+	}
+	if len(got.Batch.Gauges) != 1 || got.Batch.Gauges[0].Value != 2 {
+		t.Fatalf("gauges=%v", got.Batch.Gauges)
+	}
+}
+
+func TestAttrCapUsesSortedKeys(t *testing.T) {
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "n",
+					Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+						DataPoints: []*metricspb.NumberDataPoint{{
+							TimeUnixNano: 1,
+							Attributes: []*commonpb.KeyValue{
+								kvString("z_last", "1"),
+								kvString("a_first", "2"),
+								kvString("m_mid", "3"),
+							},
+						}},
+					}},
+				}},
+			}},
+		}},
+	}
+	got := Map(req, time.Now().UTC(), Limits{MaxAttrKeys: 2, MaxAttrValue: 32})
+	attrs := got.Batch.Gauges[0].Attributes
+	if len(attrs) != 2 {
+		t.Fatalf("attrs=%v", attrs)
+	}
+	if _, ok := attrs["a_first"]; !ok {
+		t.Fatalf("expected a_first, got %v", attrs)
+	}
+	if _, ok := attrs["m_mid"]; !ok {
+		t.Fatalf("expected m_mid, got %v", attrs)
+	}
+	if _, ok := attrs["z_last"]; ok {
+		t.Fatalf("z_last should be dropped: %v", attrs)
+	}
+}
+
+func TestResourceAttributesCopiedPerRow(t *testing.T) {
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "n",
+					Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+						DataPoints: []*metricspb.NumberDataPoint{
+							{TimeUnixNano: 1, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1}},
+							{TimeUnixNano: 2, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 2}},
+						},
+					}},
+				}},
+			}},
+		}},
+	}
+	got := Map(req, time.Now().UTC(), Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
+	if len(got.Batch.Gauges) != 2 {
+		t.Fatal("expected 2 gauges")
+	}
+	got.Batch.Gauges[0].ResourceAttributes["mutated"] = "x"
+	if _, ok := got.Batch.Gauges[1].ResourceAttributes["mutated"]; ok {
+		t.Fatal("resource attributes map was shared between rows")
+	}
+}
+
+func TestHistogramOptionalFieldsNil(t *testing.T) {
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "latency",
+					Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+						DataPoints: []*metricspb.HistogramDataPoint{{
+							TimeUnixNano: 1,
+							Count:        5,
+						}},
+					}},
+				}},
+			}},
+		}},
+	}
+	got := Map(req, time.Now().UTC(), Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
+	if len(got.Batch.Histograms) != 1 {
+		t.Fatal("expected histogram row")
+	}
+	h := got.Batch.Histograms[0]
+	if h.Sum != nil || h.Min != nil || h.Max != nil {
+		t.Fatalf("optional fields should be nil: sum=%v min=%v max=%v", h.Sum, h.Min, h.Max)
+	}
+}
+
 func TestUnknownMetricTypeRejected(t *testing.T) {
 	req := &colmetricspb.ExportMetricsServiceRequest{
 		ResourceMetrics: []*metricspb.ResourceMetrics{{
