@@ -3,6 +3,13 @@ set -euo pipefail
 
 export PATH="/usr/local/go/bin:${PATH}"
 
+stop_listeners_on() {
+  local port=$1
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${port}/tcp" 2>/dev/null || true
+  fi
+}
+
 ensure_docker_access() {
   if docker info >/dev/null 2>&1; then
     return 0
