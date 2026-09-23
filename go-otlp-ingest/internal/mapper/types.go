@@ -33,6 +33,55 @@ func (b *Batch) Take() Batch {
 	return out
 }
 
+// TakeUpTo removes up to max rows from the batch (gauges first, then sums, etc.) and returns them.
+func (b *Batch) TakeUpTo(max int) (Batch, int) {
+	if max <= 0 || b.Len() == 0 {
+		return Batch{}, 0
+	}
+	var out Batch
+	taken := 0
+	rem := max
+
+	if n := min(rem, len(b.Gauges)); n > 0 {
+		out.Gauges = append(out.Gauges, b.Gauges[:n]...)
+		b.Gauges = b.Gauges[n:]
+		taken += n
+		rem -= n
+	}
+	if rem > 0 {
+		if n := min(rem, len(b.Sums)); n > 0 {
+			out.Sums = append(out.Sums, b.Sums[:n]...)
+			b.Sums = b.Sums[n:]
+			taken += n
+			rem -= n
+		}
+	}
+	if rem > 0 {
+		if n := min(rem, len(b.Histograms)); n > 0 {
+			out.Histograms = append(out.Histograms, b.Histograms[:n]...)
+			b.Histograms = b.Histograms[n:]
+			taken += n
+			rem -= n
+		}
+	}
+	if rem > 0 {
+		if n := min(rem, len(b.ExpHistograms)); n > 0 {
+			out.ExpHistograms = append(out.ExpHistograms, b.ExpHistograms[:n]...)
+			b.ExpHistograms = b.ExpHistograms[n:]
+			taken += n
+			rem -= n
+		}
+	}
+	if rem > 0 {
+		if n := min(rem, len(b.Summaries)); n > 0 {
+			out.Summaries = append(out.Summaries, b.Summaries[:n]...)
+			b.Summaries = b.Summaries[n:]
+			taken += n
+		}
+	}
+	return out, taken
+}
+
 type Common struct {
 	TimeUnix           time.Time
 	StartTimeUnix      time.Time

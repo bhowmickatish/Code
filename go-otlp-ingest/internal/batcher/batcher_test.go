@@ -70,9 +70,55 @@ func TestBackpressure(t *testing.T) {
 	}
 }
 
+func TestFlushChunksByBatchSize(t *testing.T) {
+	w := &chunkTrackingWriter{}
+	b := New(w, 2, 10, time.Hour, nil)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.Close(ctx)
+	})
+
+	five := mapper.Batch{Gauges: []mapper.GaugeRow{{}, {}, {}, {}, {}}}
+	if err := b.Enqueue(context.Background(), five); err != nil {
+		t.Fatal(err)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.totalRows != 5 {
+		t.Fatalf("rows=%d want 5", w.totalRows)
+	}
+	if w.maxInsert > 2 {
+		t.Fatalf("maxInsert=%d want <= 2", w.maxInsert)
+	}
+	if w.calls < 3 {
+		t.Fatalf("insert calls=%d want at least 3", w.calls)
+	}
+}
+
+type chunkTrackingWriter struct {
+	mu        sync.Mutex
+	calls     int
+	totalRows int
+	maxInsert int
+}
+
+func (w *chunkTrackingWriter) Insert(ctx context.Context, batch mapper.Batch) (mapper.Batch, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := batch.Len()
+	w.calls++
+	w.totalRows += n
+	if n > w.maxInsert {
+		w.maxInsert = n
+	}
+	return mapper.Batch{}, nil
+}
+
 func TestPartialInsertRetriesRemainingOnly(t *testing.T) {
 	w := &trackingPartialWriter{}
-	b := New(w, 1, 10, time.Hour, nil)
+	b := New(w, 10, 10, time.Hour, nil)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -134,6 +180,9 @@ func (w *trackingPartialWriter) Insert(ctx context.Context, batch mapper.Batch) 
 		w.gaugeCalls++
 		remaining := batch
 		remaining.Gauges = nil
+		if remaining.Len() == 0 {
+			return mapper.Batch{}, nil
+		}
 		return remaining, errors.New("sum failed")
 	}
 	if len(batch.Sums) > 0 {

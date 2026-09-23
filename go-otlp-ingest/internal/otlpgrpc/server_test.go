@@ -93,7 +93,6 @@ func TestExportBackpressure(t *testing.T) {
 	b := batcher.New(&sink{}, 100, 1, time.Hour, nil)
 	t.Cleanup(func() { closeBatcher(t, b) })
 	srv := New(b, 100, mapper.Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
-<<<<<<< HEAD
 	req := gaugeReq()
 	req.ResourceMetrics[0].ScopeMetrics[0].Metrics[0].GetGauge().DataPoints = append(
 		req.ResourceMetrics[0].ScopeMetrics[0].Metrics[0].GetGauge().DataPoints,
@@ -103,12 +102,6 @@ func TestExportBackpressure(t *testing.T) {
 		},
 	)
 	_, err := srv.Export(context.Background(), req)
-=======
-	if _, err := srv.Export(context.Background(), gaugeReq()); err != nil {
-		t.Fatal(err)
-	}
-	_, err := srv.Export(context.Background(), gaugeReq())
->>>>>>> origin/main
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("code=%v err=%v", status.Code(err), err)
 	}

@@ -302,13 +302,13 @@ Export RPC
         ├─ queue full     → RESOURCE_EXHAUSTED (no enqueue)
         └─ insert fails   → UNAVAILABLE after worker retries
   → background flush (size / interval) coalesces concurrent Export batches
-        → clickhouse.Insert(typed batches)
+        → clickhouse.Insert up to BatchSize rows per flush
 ```
 
 | Setting          | Role |
 | ---------------- | ---- |
-| `BatchSize`      | Flush when this many rows are pending |
-| `BatchInterval`  | Flush leftover rows on a timer |
+| `BatchSize`      | Flush when this many rows are pending (max rows per insert) |
+| `BatchInterval`  | Flush up to `BatchSize` rows from the pending queue on a timer |
 | `QueueCapacity`  | Max rows waiting (mapped but not yet inserted) |
 
 One flush worker is enough for v1. Inserts are grouped **by table** (five insert paths) so a gauge batch does not mix with histogram rows.

@@ -21,6 +21,11 @@ type Writer interface {
 	Insert(ctx context.Context, batch mapper.Batch) (remaining mapper.Batch, err error)
 }
 
+type flushWaiter struct {
+	ch   chan error
+	rows int
+}
+
 type Batcher struct {
 	writer    Writer
 	batchSize int
@@ -34,7 +39,7 @@ type Batcher struct {
 	shutdown   bool
 	insertFail bool
 	flushErr   error
-	waiters    []chan error
+	waiters    []flushWaiter
 
 	wake   chan struct{}
 	done   chan struct{}
@@ -93,7 +98,7 @@ func (b *Batcher) Enqueue(ctx context.Context, batch mapper.Batch) error {
 	}
 	b.pending.Append(batch)
 	b.pendingN += n
-	b.waiters = append(b.waiters, waitCh)
+	b.waiters = append(b.waiters, flushWaiter{ch: waitCh, rows: n})
 	if b.pendingN >= b.batchSize {
 		b.signalLocked()
 	}
@@ -129,7 +134,6 @@ func (b *Batcher) Close(ctx context.Context) error {
 }
 
 // IngestReady reports whether new Export RPCs should be accepted.
-// False when ClickHouse inserts are failing or the batcher is shutting down.
 func (b *Batcher) IngestReady() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -154,29 +158,39 @@ func (b *Batcher) loop() {
 	}
 }
 
-func (b *Batcher) takeIf(min int) (mapper.Batch, int) {
+func (b *Batcher) takeUpTo(max int) (mapper.Batch, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.pendingN == 0 || b.pendingN < min {
+	if b.pendingN == 0 {
 		return mapper.Batch{}, 0
 	}
-	n := b.pendingN
-	out := b.pending.Take()
-	b.pendingN = 0
+	if max > b.pendingN {
+		max = b.pendingN
+	}
+	out, n := b.pending.TakeUpTo(max)
+	b.pendingN -= n
 	return out, n
 }
 
 func (b *Batcher) flushOnce(ctx context.Context) {
-	batch, n := b.takeIf(1)
-	if n == 0 {
-		return
+	for {
+		batch, n := b.takeUpTo(b.batchSize)
+		if n == 0 {
+			return
+		}
+		b.send(ctx, batch, n, false)
+		b.mu.Lock()
+		more := b.pendingN > 0
+		b.mu.Unlock()
+		if !more {
+			return
+		}
 	}
-	b.send(ctx, batch, n, false)
 }
 
 func (b *Batcher) flushUntilEmpty(ctx context.Context) {
 	for {
-		batch, n := b.takeIf(1)
+		batch, n := b.takeUpTo(b.batchSize)
 		if n == 0 {
 			return
 		}
@@ -197,11 +211,16 @@ func (b *Batcher) send(ctx context.Context, batch mapper.Batch, n int, onShutdow
 		remaining, err = b.writer.Insert(ctx, remaining)
 		if err == nil {
 			b.setInsertFail(false)
-			b.completeWaiters(nil)
+			b.releaseWaiters(n, nil)
 			return
 		}
 
 		b.setInsertFail(true)
+		if remaining.Len() == 0 {
+			b.log.Error("clickhouse insert failed with empty remaining batch", "err", err)
+			b.completeAllWaiters(err)
+			return
+		}
 		b.log.Error("clickhouse insert failed",
 			"err", err,
 			"rows", remaining.Len(),
@@ -231,13 +250,34 @@ func (b *Batcher) send(ctx context.Context, batch mapper.Batch, n int, onShutdow
 	}
 }
 
-func (b *Batcher) completeWaiters(err error) {
+func (b *Batcher) releaseWaiters(inserted int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err != nil {
+		return
+	}
+	remaining := inserted
+	for remaining > 0 && len(b.waiters) > 0 {
+		w := &b.waiters[0]
+		if remaining >= w.rows {
+			remaining -= w.rows
+			ch := w.ch
+			b.waiters = b.waiters[1:]
+			ch <- nil
+			continue
+		}
+		w.rows -= remaining
+		remaining = 0
+	}
+}
+
+func (b *Batcher) completeAllWaiters(err error) {
 	b.mu.Lock()
 	waiters := b.waiters
 	b.waiters = nil
 	b.mu.Unlock()
-	for _, ch := range waiters {
-		ch <- err
+	for _, w := range waiters {
+		w.ch <- err
 	}
 }
 
@@ -256,7 +296,7 @@ func (b *Batcher) recordFlushDrop(rows int, err error) {
 	}
 	b.mu.Unlock()
 	b.log.Error("shutdown flush dropped rows", "rows", rows, "err", err)
-	b.completeWaiters(flushErr)
+	b.completeAllWaiters(flushErr)
 }
 
 func (b *Batcher) signal() {
