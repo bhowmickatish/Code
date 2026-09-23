@@ -43,13 +43,19 @@ func (s *Server) Export(ctx context.Context, req *colmetricspb.ExportMetricsServ
 		return nil, statusFromContext(err)
 	}
 
-	if err := s.batcher.Enqueue(res.Batch); err != nil {
+	if err := s.batcher.Enqueue(ctx, res.Batch); err != nil {
 		switch {
 		case errors.Is(err, batcher.ErrBackpressure):
 			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		case errors.Is(err, batcher.ErrUnavailable), errors.Is(err, batcher.ErrShutdown):
 			return nil, status.Error(codes.Unavailable, err.Error())
 		default:
+			if errors.Is(err, context.Canceled) {
+				return nil, status.Error(codes.Canceled, err.Error())
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, status.Error(codes.DeadlineExceeded, err.Error())
+			}
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}

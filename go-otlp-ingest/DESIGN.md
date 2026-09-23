@@ -108,7 +108,7 @@ go-otlp-ingest/
 5. Writer inserts via the native ClickHouse protocol (`clickhouse-go` v2).
 6. RPC returns `ExportMetricsServiceResponse`. Mapping or insert failures use OTLP `partial_success` (rejected point count + error message), not a custom error schema.
 
-**Ack timing:** gRPC success is returned **after a successful handoff to the batcher**, not after ClickHouse fsync. Export latency stays low. If the process dies with an unflushed batch, producers retry (at-least-once). Duplicate rows are possible and accepted.
+**Ack timing:** gRPC success is returned **after ClickHouse accepts the batch insert** (`clickhouse-go` with `wait_for_async_insert=1`). `Export` blocks until the batcher flush for that request completes successfully. If ClickHouse is down, the RPC fails with `UNAVAILABLE` (after retries in the flush worker) rather than returning success early. Duplicate rows are still possible if the client retries after a successful response or on partial RPC failures.
 
 A later production shape can put Kafka between mapper and ClickHouse so ingest ACK and ClickHouse durability are decoupled.
 
@@ -146,7 +146,7 @@ Use this when some points map but others fail (unknown metric type, oversize att
 | Empty request                     | `INVALID_ARGUMENT`        |
 | Over max data-point budget        | `INVALID_ARGUMENT`        |
 | Batcher queue full                | `RESOURCE_EXHAUSTED`      |
-| ClickHouse unavailable at handoff | `UNAVAILABLE`             |
+| ClickHouse unavailable during insert | `UNAVAILABLE`             |
 | Shutdown in progress              | `UNAVAILABLE`             |
 
 `RESOURCE_EXHAUSTED` is the backpressure signal so SDKs and Collectors retry with backoff instead of unbounded RAM on the ingest process.
@@ -281,9 +281,10 @@ Walk order: each `ResourceMetrics` → each `ScopeMetrics` → each `Metric` →
 | Nil data point in a metric | Reject that point via `partial_success` |
 | Number value | `AsDouble` if set, else `AsInt` → `float64` |
 | Missing `time_unix_nano` | Use server receive time (last resort; documented here) |
+| Missing `start_time_unix_nano` | Store Unix epoch (`1970-01-01 UTC`) in `StartTimeUnix` |
 | `service.name` missing | Empty string `ServiceName`; still store full resource map |
 | Attribute values | Stringify non-string `AnyValue` (bool, int, double, bytes, array, kvlist) so ClickHouse `Map(String, String)` stays uniform |
-| Oversize maps | Cap max keys (sorted alphabetically) and max value length; drop excess keys |
+| Oversize maps | Cap max keys (priority keys such as `service.name` and `device.id` first, then alphabetical) and max value length; drop excess keys |
 | Unknown metric type | Reject those points via `partial_success` |
 | Histogram sum/min/max | Stored as `Nullable(Float64)`; unset OTLP fields remain SQL `NULL` |
 
@@ -296,26 +297,25 @@ Bytes attributes are **hex-encoded**. Nested array/kvlist values are JSON-encode
 ```
 Export RPC
   → map to rows
-  → batcher.Enqueue(rows)
-        ├─ queue has room → ack RPC (empty ExportMetricsServiceResponse)
-        └─ queue full     → RESOURCE_EXHAUSTED (no enqueue)
-  → background flush
-        ├─ len(batch) >= BatchSize
-        └─ or ticker BatchInterval
-        → clickhouse.Insert(typed batches)
+  → batcher.Enqueue(ctx, rows)  [blocks until insert succeeds]
+        ├─ queue has room → wait for flush + ClickHouse insert → ack RPC
+        ├─ queue full     → RESOURCE_EXHAUSTED (no enqueue)
+        └─ insert fails   → UNAVAILABLE after worker retries
+  → background flush (size / interval) coalesces concurrent Export batches
+        → clickhouse.Insert up to BatchSize rows per flush
 ```
 
 | Setting          | Role |
 | ---------------- | ---- |
-| `BatchSize`      | Flush when this many rows are pending |
-| `BatchInterval`  | Flush leftover rows on a timer |
+| `BatchSize`      | Flush when this many rows are pending (max rows per insert) |
+| `BatchInterval`  | Flush up to `BatchSize` rows from the pending queue on a timer |
 | `QueueCapacity`  | Max rows waiting (mapped but not yet inserted) |
 
 One flush worker is enough for v1. Inserts are grouped **by table** (five insert paths) so a gauge batch does not mix with histogram rows.
 
-On shutdown: stop accepting RPCs → flush remaining queue → close ClickHouse.
+On shutdown: stop accepting RPCs → flush remaining queue (waiters get error if rows are dropped) → close ClickHouse.
 
-If ClickHouse is down during flush, the worker retries with backoff **or** drops and increments a log counter. v1 has **no local WAL**; durability relies on producer retry of `Export`. Prefer failing new `Export` calls with `UNAVAILABLE` when the queue is stuck because CH is down, rather than growing RAM.
+If ClickHouse is down during flush, the worker retries with backoff; new `Export` calls fail with `UNAVAILABLE` while `insertFail` is set. Waiters for in-flight exports block until insert succeeds or the client context is canceled.
 
 ---
 
@@ -364,7 +364,7 @@ Env-based singleton, same idea as `go-zookeeper/internal/config`.
 **Shutdown flush**
 
 - Pending rows are retried for up to 10s during shutdown.
-- If rows still cannot be inserted, they are logged and `Close` returns an error (data was already ACKed to clients).
+- If rows still cannot be inserted, in-flight waiters receive an error, rows are logged, and `Close` returns an error.
 
 ---
 
@@ -398,7 +398,7 @@ Local send path:
 
 ### 12.1 Duplicate data points
 
-Retries after a successful batcher handoff but failed (or unflushed) insert produce duplicates. MergeTree does not dedupe. Partial multi-table failures within one flush retry only the tables not yet inserted, avoiding duplicate gauge rows when a later table fails.
+Client retries after a successful `Export` (network race) or duplicate OTLP payloads produce duplicate rows. MergeTree does not dedupe. Partial multi-table failures within one flush retry only the tables not yet inserted, avoiding duplicate gauge rows when a later table fails.
 
 Downstream queries should tolerate duplicates (e.g. `argMax` / aggregations), or a later version can use `ReplacingMergeTree` with a stable identity.
 
