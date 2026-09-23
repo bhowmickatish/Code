@@ -11,15 +11,16 @@ import (
 const DefaultClickHouseDSN = "clickhouse://default:@127.0.0.1:9000/otel"
 
 type Config struct {
-	GRPCAddr      string
-	HealthAddr    string
-	ClickHouseDSN string
-	BatchSize     int
-	BatchInterval time.Duration
-	QueueCapacity int
-	MaxDataPoints int
-	MaxAttrKeys   int
-	MaxAttrValue  int
+	GRPCAddr          string
+	HealthAddr        string
+	ClickHouseDSN     string
+	BatchSize         int
+	BatchInterval     time.Duration
+	QueueCapacity     int
+	MaxDataPoints     int
+	MaxAttrKeys       int
+	MaxAttrValue      int
+	GRPCMaxRecvBytes  int
 }
 
 var (
@@ -56,6 +57,10 @@ func LoadFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	maxRecv, err := envInt("GRPC_MAX_RECV_BYTES", 32<<20)
+	if err != nil {
+		return Config{}, err
+	}
 	interval, err := envDuration("BATCH_INTERVAL", time.Second)
 	if err != nil {
 		return Config{}, err
@@ -69,8 +74,9 @@ func LoadFromEnv() (Config, error) {
 		BatchInterval: interval,
 		QueueCapacity: queueCap,
 		MaxDataPoints: maxPoints,
-		MaxAttrKeys:   maxKeys,
-		MaxAttrValue:  maxVal,
+		MaxAttrKeys:      maxKeys,
+		MaxAttrValue:     maxVal,
+		GRPCMaxRecvBytes: maxRecv,
 	}, nil
 }
 

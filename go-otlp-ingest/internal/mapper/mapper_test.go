@@ -90,6 +90,39 @@ func TestMissingTimestampUsesReceiveTime(t *testing.T) {
 	if got.Batch.Gauges[0].TimeUnix != recv {
 		t.Fatalf("time=%v want %v", got.Batch.Gauges[0].TimeUnix, recv)
 	}
+	if !got.Batch.Gauges[0].StartTimeUnix.Equal(time.Unix(0, 0).UTC()) {
+		t.Fatalf("start=%v want epoch", got.Batch.Gauges[0].StartTimeUnix)
+	}
+}
+
+func TestAttrCapKeepsPriorityKey(t *testing.T) {
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "n",
+					Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+						DataPoints: []*metricspb.NumberDataPoint{{
+							TimeUnixNano: 1,
+							Attributes: []*commonpb.KeyValue{
+								kvString("aaa", "1"),
+								kvString("device.id", "dev-9"),
+								kvString("zzz", "3"),
+							},
+						}},
+					}},
+				}},
+			}},
+		}},
+	}
+	got := Map(req, time.Now().UTC(), Limits{MaxAttrKeys: 2, MaxAttrValue: 32})
+	attrs := got.Batch.Gauges[0].Attributes
+	if len(attrs) != 2 {
+		t.Fatalf("attrs=%v", attrs)
+	}
+	if attrs["device.id"] != "dev-9" {
+		t.Fatalf("device.id dropped: %v", attrs)
+	}
 }
 
 func TestAttrCapsAndBytesHex(t *testing.T) {

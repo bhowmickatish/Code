@@ -62,3 +62,4 @@ If the database is `default` instead of `otel`, omit the `otel.` prefix or set `
 | `MAX_DATA_POINTS` | `100000` | Per-RPC budget |
 | `MAX_ATTR_KEYS` | `64` | Attribute map cap |
 | `MAX_ATTR_VALUE` | `1024` | Attribute value length cap |
+| `GRPC_MAX_RECV_BYTES` | `33554432` (32 MiB) | Max gRPC receive message size for OTLP Export |

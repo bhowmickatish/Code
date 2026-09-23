@@ -52,7 +52,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	gs := grpc.NewServer()
+	grpcOpts := []grpc.ServerOption{}
+	if cfg.GRPCMaxRecvBytes > 0 {
+		grpcOpts = append(grpcOpts, grpc.MaxRecvMsgSize(cfg.GRPCMaxRecvBytes))
+	}
+	gs := grpc.NewServer(grpcOpts...)
 	colmetricspb.RegisterMetricsServiceServer(gs, otlpgrpc.New(b, cfg.MaxDataPoints, mapper.Limits{
 		MaxAttrKeys:  cfg.MaxAttrKeys,
 		MaxAttrValue: cfg.MaxAttrValue,
@@ -85,6 +89,7 @@ func main() {
 		slog.Info("http health listening", "addr", cfg.HealthAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("http health failed", "err", err)
+			stop()
 		}
 	}()
 
@@ -92,7 +97,7 @@ func main() {
 		slog.Info("otlp metrics grpc listening", "addr", cfg.GRPCAddr)
 		if err := gs.Serve(lis); err != nil {
 			slog.Error("grpc serve failed", "err", err)
-			os.Exit(1)
+			stop()
 		}
 	}()
 

@@ -334,6 +334,7 @@ Env-based singleton, same idea as `go-zookeeper/internal/config`.
 | `MAX_DATA_POINTS`  | `100000`             | Per-RPC budget |
 | `MAX_ATTR_KEYS`    | `64`                 | Attribute map cap |
 | `MAX_ATTR_VALUE`   | `1024`               | Attribute value length cap |
+| `GRPC_MAX_RECV_BYTES` | `33554432`        | Max gRPC receive message size (32 MiB) |
 
 ---
 
