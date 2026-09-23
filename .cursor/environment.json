@@ -5,6 +5,5 @@
     "context": "."
   },
   "user": "ubuntu",
-  "install": "bash .cursor/cloud-agent-install.sh",
-  "start": "bash .cursor/cloud-agent-start.sh"
+  "install": "bash .cursor/cloud-agent-install.sh"
 }
