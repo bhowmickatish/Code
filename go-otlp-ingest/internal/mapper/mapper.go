@@ -16,6 +16,15 @@ import (
 
 const serviceNameKey = "service.name"
 
+var priorityAttributeKeys = []string{
+	"service.name",
+	"device.id",
+	"host.name",
+	"host.id",
+	"k8s.pod.name",
+	"k8s.namespace.name",
+}
+
 func CountDataPoints(req *colmetricspb.ExportMetricsServiceRequest) int {
 	if req == nil {
 		return 0
@@ -142,7 +151,7 @@ func mapMetric(
 	base := func(attrs []*commonpb.KeyValue, start, ts uint64) Common {
 		return Common{
 			TimeUnix:           timestamp(ts, recv),
-			StartTimeUnix:      timestamp(start, time.Time{}),
+			StartTimeUnix:      timestampStart(start),
 			ServiceName:        serviceName,
 			MetricName:         m.Name,
 			MetricDescription:  m.Description,
@@ -306,30 +315,65 @@ func resourceAttrs(res *resourcepb.Resource, lim Limits) (map[string]string, str
 	return m, m[serviceNameKey]
 }
 
+type attrPair struct {
+	key string
+	val string
+}
+
 func attrMap(kvs []*commonpb.KeyValue, lim Limits) map[string]string {
-	type pair struct {
-		key string
-		val string
-	}
-	pairs := make([]pair, 0, len(kvs))
+	pairs := make([]attrPair, 0, len(kvs))
 	for _, kv := range kvs {
 		if kv == nil || kv.Key == "" {
 			continue
 		}
-		pairs = append(pairs, pair{
+		pairs = append(pairs, attrPair{
 			key: kv.Key,
 			val: truncate(anyValueString(kv.Value), lim.MaxAttrValue),
 		})
 	}
-	slices.SortFunc(pairs, func(a, b pair) int {
+	slices.SortFunc(pairs, func(a, b attrPair) int {
 		return strings.Compare(a.key, b.key)
 	})
 	if len(pairs) > lim.MaxAttrKeys {
-		pairs = pairs[:lim.MaxAttrKeys]
+		pairs = capAttributePairs(pairs, lim.MaxAttrKeys)
 	}
 	out := make(map[string]string, len(pairs))
 	for _, p := range pairs {
 		out[p.key] = p.val
+	}
+	return out
+}
+
+func capAttributePairs(pairs []attrPair, max int) []attrPair {
+	if len(pairs) <= max {
+		return pairs
+	}
+	kept := make(map[string]struct{}, max)
+	out := make([]attrPair, 0, max)
+	for _, pk := range priorityAttributeKeys {
+		for _, p := range pairs {
+			if p.key != pk {
+				continue
+			}
+			if _, ok := kept[p.key]; ok {
+				break
+			}
+			out = append(out, p)
+			kept[p.key] = struct{}{}
+			break
+		}
+		if len(out) >= max {
+			return out
+		}
+	}
+	for _, p := range pairs {
+		if _, ok := kept[p.key]; ok {
+			continue
+		}
+		out = append(out, p)
+		if len(out) >= max {
+			break
+		}
 	}
 	return out
 }
@@ -460,6 +504,14 @@ func numberValue(p *metricspb.NumberDataPoint) float64 {
 func timestamp(unixNano uint64, fallback time.Time) time.Time {
 	if unixNano == 0 {
 		return fallback
+	}
+	return time.Unix(0, int64(unixNano)).UTC()
+}
+
+// timestampStart maps missing OTLP start times to Unix epoch instead of Go's zero time (year 1).
+func timestampStart(unixNano uint64) time.Time {
+	if unixNano == 0 {
+		return time.Unix(0, 0).UTC()
 	}
 	return time.Unix(0, int64(unixNano)).UTC()
 }

@@ -71,6 +71,37 @@ func TestExportTooMany(t *testing.T) {
 	}
 }
 
+func TestExportPartialSuccess(t *testing.T) {
+	b := batcher.New(&sink{}, 10, 100, time.Hour, nil)
+	t.Cleanup(func() { closeBatcher(t, b) })
+	srv := New(b, 100, mapper.Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
+	req := gaugeReq()
+	req.ResourceMetrics[0].ScopeMetrics[0].Metrics = append(
+		req.ResourceMetrics[0].ScopeMetrics[0].Metrics,
+		&metricspb.Metric{Name: "broken", Data: &metricspb.Metric_Gauge{}},
+	)
+	resp, err := srv.Export(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.PartialSuccess == nil || resp.PartialSuccess.RejectedDataPoints != 1 {
+		t.Fatalf("partial=%v", resp.PartialSuccess)
+	}
+}
+
+func TestExportBackpressure(t *testing.T) {
+	b := batcher.New(&sink{}, 100, 1, time.Hour, nil)
+	t.Cleanup(func() { closeBatcher(t, b) })
+	srv := New(b, 100, mapper.Limits{MaxAttrKeys: 8, MaxAttrValue: 32})
+	if _, err := srv.Export(context.Background(), gaugeReq()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := srv.Export(context.Background(), gaugeReq())
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code=%v err=%v", status.Code(err), err)
+	}
+}
+
 func closeBatcher(t *testing.T, b *batcher.Batcher) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
