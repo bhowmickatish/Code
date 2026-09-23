@@ -34,6 +34,7 @@ type Batcher struct {
 	shutdown   bool
 	insertFail bool
 	flushErr   error
+	waiters    []chan error
 
 	wake   chan struct{}
 	done   chan struct{}
@@ -67,28 +68,45 @@ func New(writer Writer, batchSize, capacity int, interval time.Duration, log *sl
 	return b
 }
 
-func (b *Batcher) Enqueue(batch mapper.Batch) error {
+// Enqueue appends rows and blocks until they are successfully inserted into ClickHouse
+// (or ctx is canceled). Export RPC success implies durable handoff to ClickHouse.
+func (b *Batcher) Enqueue(ctx context.Context, batch mapper.Batch) error {
 	n := batch.Len()
 	if n == 0 {
 		return nil
 	}
+
+	waitCh := make(chan error, 1)
+
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.shutdown {
+		b.mu.Unlock()
 		return ErrShutdown
 	}
 	if b.insertFail {
+		b.mu.Unlock()
 		return ErrUnavailable
 	}
 	if b.pendingN+n > b.capacity {
+		b.mu.Unlock()
 		return ErrBackpressure
 	}
 	b.pending.Append(batch)
 	b.pendingN += n
+	b.waiters = append(b.waiters, waitCh)
 	if b.pendingN >= b.batchSize {
-		b.signal()
+		b.signalLocked()
 	}
-	return nil
+	b.mu.Unlock()
+
+	b.signal()
+
+	select {
+	case err := <-waitCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (b *Batcher) Close(ctx context.Context) error {
@@ -179,6 +197,7 @@ func (b *Batcher) send(ctx context.Context, batch mapper.Batch, n int, onShutdow
 		remaining, err = b.writer.Insert(ctx, remaining)
 		if err == nil {
 			b.setInsertFail(false)
+			b.completeWaiters(nil)
 			return
 		}
 
@@ -212,6 +231,16 @@ func (b *Batcher) send(ctx context.Context, batch mapper.Batch, n int, onShutdow
 	}
 }
 
+func (b *Batcher) completeWaiters(err error) {
+	b.mu.Lock()
+	waiters := b.waiters
+	b.waiters = nil
+	b.mu.Unlock()
+	for _, ch := range waiters {
+		ch <- err
+	}
+}
+
 func (b *Batcher) setInsertFail(failed bool) {
 	b.mu.Lock()
 	b.insertFail = failed
@@ -221,14 +250,23 @@ func (b *Batcher) setInsertFail(failed bool) {
 func (b *Batcher) recordFlushDrop(rows int, err error) {
 	b.mu.Lock()
 	b.insertFail = true
+	flushErr := fmt.Errorf("shutdown flush dropped %d rows: %w", rows, err)
 	if b.flushErr == nil {
-		b.flushErr = fmt.Errorf("shutdown flush dropped %d rows: %w", rows, err)
+		b.flushErr = flushErr
 	}
 	b.mu.Unlock()
 	b.log.Error("shutdown flush dropped rows", "rows", rows, "err", err)
+	b.completeWaiters(flushErr)
 }
 
 func (b *Batcher) signal() {
+	select {
+	case b.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (b *Batcher) signalLocked() {
 	select {
 	case b.wake <- struct{}{}:
 	default:

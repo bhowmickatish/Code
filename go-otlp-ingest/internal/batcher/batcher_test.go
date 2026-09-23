@@ -37,24 +37,22 @@ func TestEnqueueFlushBySize(t *testing.T) {
 		_ = b.Close(ctx)
 	})
 
+	ctx := context.Background()
 	row := mapper.Batch{Gauges: []mapper.GaugeRow{{}}}
-	if err := b.Enqueue(row); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Enqueue(row); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		w.mu.Lock()
-		n := w.rows
-		w.mu.Unlock()
-		if n == 2 {
-			return
+	go func() {
+		if err := b.Enqueue(ctx, row); err != nil {
+			t.Error(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+	}()
+	if err := b.Enqueue(ctx, row); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal("did not flush")
+	w.mu.Lock()
+	n := w.rows
+	w.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("rows=%d want 2", n)
+	}
 }
 
 func TestBackpressure(t *testing.T) {
@@ -66,11 +64,8 @@ func TestBackpressure(t *testing.T) {
 		_ = b.Close(ctx)
 	})
 
-	row := mapper.Batch{Gauges: []mapper.GaugeRow{{}}}
-	if err := b.Enqueue(row); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Enqueue(row); err != ErrBackpressure {
+	twoRows := mapper.Batch{Gauges: []mapper.GaugeRow{{}, {}}}
+	if err := b.Enqueue(context.Background(), twoRows); err != ErrBackpressure {
 		t.Fatalf("got %v want ErrBackpressure", err)
 	}
 }
@@ -88,24 +83,17 @@ func TestPartialInsertRetriesRemainingOnly(t *testing.T) {
 		Gauges: []mapper.GaugeRow{{}, {}},
 		Sums:   []mapper.SumRow{{}},
 	}
-	if err := b.Enqueue(batch); err != nil {
+	if err := b.Enqueue(context.Background(), batch); err != nil {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		w.mu.Lock()
-		gaugeCalls := w.gaugeCalls
-		sumCalls := w.sumCalls
-		w.mu.Unlock()
-		if gaugeCalls == 1 && sumCalls == 1 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	t.Fatalf("gaugeCalls=%d sumCalls=%d", w.gaugeCalls, w.sumCalls)
+	gaugeCalls := w.gaugeCalls
+	sumCalls := w.sumCalls
+	w.mu.Unlock()
+	if gaugeCalls != 1 || sumCalls != 1 {
+		t.Fatalf("gaugeCalls=%d sumCalls=%d", gaugeCalls, sumCalls)
+	}
 }
 
 func TestIngestReadyReflectsInsertFail(t *testing.T) {
@@ -120,9 +108,9 @@ func TestIngestReadyReflectsInsertFail(t *testing.T) {
 	if !b.IngestReady() {
 		t.Fatal("expected ready before failure")
 	}
-	if err := b.Enqueue(mapper.Batch{Gauges: []mapper.GaugeRow{{}}}); err != nil {
-		t.Fatal(err)
-	}
+	go func() {
+		_ = b.Enqueue(context.Background(), mapper.Batch{Gauges: []mapper.GaugeRow{{}}})
+	}()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if !b.IngestReady() {
